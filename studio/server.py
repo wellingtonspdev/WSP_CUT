@@ -949,6 +949,51 @@ def rerender(jid: str, cid: str, body: dict = Body(...)):
     return jobs.public(job)
 
 
+@app.post("/api/jobs/{jid}/recut")
+def recut_job(jid: str, body: dict = Body(default={})):
+    _need_verified()
+    job = _job_or_404(jid)
+    if job["status"] in ("queued", "running", "live"):
+        raise HTTPException(409, "This video is still being worked on. Wait for it to finish first.")
+    _throttle("recut:" + ctx.uid(), 20, 600, "That's a lot of re-cuts in a short time. Wait a few minutes.")
+    try:
+        jobs.request_recut(jid, body or {})
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return jobs.public(job)
+
+
+@app.post("/api/jobs/{jid}/clips/{cid}/thumb")
+def regen_clip_thumb(jid: str, cid: str, body: dict = Body(default={})):
+    job = _job_or_404(jid)
+    clip = next((c for c in job["clips"] if c["id"] == cid), None)
+    if not clip:
+        raise HTTPException(404, "No such clip")
+    if job["status"] in ("queued", "running") or clip.get("status") in ("queued", "rendering"):
+        raise HTTPException(409, "This clip is still being made. Try again when it has finished.")
+    _throttle("thumb:" + ctx.uid(), 40, 600, "Too many thumbnail previews at once. Wait a minute.")
+    body = body or {}
+    try:
+        peak = float(body["peak_t"]) if body.get("peak_t") not in (None, "") else None
+        jobs.regenerate_thumb(
+            jid, cid,
+            text=body.get("thumb_text"),
+            mode=body.get("thumb_mode"),
+            peak_t=peak,
+            collage=bool(body.get("collage", True)),
+            new_variant=bool(body.get("new_variant", True)),
+        )
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    except Exception:  # noqa: BLE001
+        raise HTTPException(500, "Não foi possível gerar a thumbnail deste clipe no momento. Tente novamente.")
+    return {**jobs.public(job), "thumb_report": clip.get("thumb_meta")}
+
+
 @app.delete("/api/jobs/{jid}")
 def delete_job(jid: str):
     job = _job_or_404(jid)

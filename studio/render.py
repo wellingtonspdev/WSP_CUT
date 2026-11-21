@@ -332,14 +332,17 @@ def render_compilation(src: Path, out_dir: Path, name: str, clip: dict, src_w: i
         cover_t = None
         peak_t = clip.get("peak_t")
         for idx, seg in enumerate(segments):
-            s, e = float(seg["start"]), float(seg["end"])
+            seg_src = Path(seg["src"]) if seg.get("src") and Path(seg["src"]).is_file() else src
+            seg_off = float(seg.get("src_offset", 0.0)) if seg_src != src else 0.0
+            s = max(0.0, float(seg["start"]) - seg_off)
+            e = max(s + 0.1, float(seg["end"]) - seg_off)
             dur = max(0.1, e - s)
-            if cover_t is None and peak_t is not None and s <= float(peak_t) <= e:
-                cover_t = max(0.0, total_dur + (float(peak_t) - s))
+            if cover_t is None and peak_t is not None and float(seg["start"]) <= float(peak_t) <= float(seg["end"]):
+                cover_t = max(0.0, total_dur + (float(peak_t) - float(seg["start"])))
             total_dur += dur
             part_name = f"seg_{idx:03d}.mp4"
             enc_timeout = max(RENDER_SECONDS, int(dur * 2.5))
-            base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.2f}", "-t", f"{dur:.2f}", "-i", str(src),
+            base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.2f}", "-t", f"{dur:.2f}", "-i", str(seg_src),
                     "-filter_complex", fc, "-map", "[v]", "-map", "0:a:0", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
                     "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", "-pix_fmt"]
             _encode_cmd(work, base, part_name, enc_timeout)
@@ -373,7 +376,7 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
         return render_compilation(src, out_dir, name, clip, src_w, src_h, default_cover=default_cover)
     out_dir.mkdir(parents=True, exist_ok=True)
     start, end = clip["start"], clip["end"]
-    is_16_9 = aspect == "16:9" or clip.get("format") == "16:9"
+    is_16_9 = aspect == "16:9" or clip.get("format") == "16:9" or clip.get("layout") == "horizontal"
     req_layout = "horizontal" if is_16_9 else clip.get("layout", "blur")
     layout, fg_h, hook_y, cap_y = geometry(src_w, src_h, req_layout)
     if is_16_9:

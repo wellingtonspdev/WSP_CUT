@@ -4,14 +4,18 @@ import json
 import os
 import math
 import queue
+import re
 import shutil
 import threading
 import time
 import traceback
 import uuid
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
-from . import brain, config, creators, ctx, facecam, games, load, media, quality, render, roman, safe, transcribe, usage
+import numpy as np
+
+from . import brain, config, creators, ctx, facecam, games, load, media, quality, render, roman, safe, thumbs, transcribe, usage
 
 class _FairQueue:
     """Whose video is next. Each person has their own line and the lines take turns, so someone who adds ten
@@ -113,7 +117,7 @@ DEFAULTS = {"max_clips": 6, "min_len": 15, "max_len": 60, "style": "bounce", "la
             "long_mode": "off", "long_min_len": 600, "long_max_len": 1200, "derive_shorts": True, "thumb_mode": "local"}
 
 
-LIMITS = {"max_clips": (1, 20), "min_len": (5, 120), "max_len": (10, 180), "quality": (360, 1080),
+LIMITS = {"max_clips": (1, 20), "min_len": (5, 600), "max_len": (10, 900), "quality": (360, 1080),
           "long_min_len": (300, 1200), "long_max_len": (600, 1800)}
 
 
@@ -156,7 +160,7 @@ def job_dir(jid) -> Path:
     return Path(_jobs[jid]["dir"])
 
 
-HIDDEN = ("dir", "user", "source_path", "recover")
+HIDDEN = ("dir", "user", "source_path", "recover", "pending_recut")
 
 
 def public(job) -> dict:
@@ -164,6 +168,9 @@ def public(job) -> dict:
     out = {k: v for k, v in job.items() if k not in HIDDEN}
     out["source"] = {k: v for k, v in job["source"].items() if k != "path"}
     jdir = Path(job["dir"]) if job.get("dir") else None
+    has_job_src = bool(job.get("source_path") and Path(job["source_path"]).is_file())
+    has_url_src = bool((job.get("source") or {}).get("type") == "url" and (job.get("source") or {}).get("url"))
+    out["has_cache"] = bool(jdir and (jdir / "words.json").is_file() and (has_job_src or has_url_src))
     out["clips"] = [
         {
             **{k: v for k, v in c.items() if k not in ("src", "fixed_words", "fixed_for")},
@@ -235,8 +242,15 @@ def _load_file(f: Path, uid: str):
     if job.get("source", {}).get("path"):
         job["source"]["path"] = _remap(job["source"]["path"], f.parent)
     if job.get("status") in ("queued", "running") and job.get("kind") != "live":
-        # Picked up again as soon as the server is back (jobs.start), from the last finished part of the transcript.
-        job.update(status="queued", stage="Picking up where it stopped", error=None, resume=True)
+        if job.get("pending_recut"):
+            job.pop("pending_recut", None)
+            for c in job.get("clips", []):
+                if c.get("status") in ("rendering", "queued"):
+                    c.update(status="error", error="Interrupted by a restart. Open it and press Save and re-make.")
+            job.update(status="done", stage="Done", error=None)
+        else:
+            # Picked up again as soon as the server is back (jobs.start), from the last finished part of the transcript.
+            job.update(status="queued", stage="Picking up where it stopped", error=None, resume=True)
     if job.get("status") == "live":
         job.update(status="done", stage="Recording paused by a server update", was_live=True)
     buffered = job.get("kind") == "live" and any((f.parent / "buffer").glob("*.ts"))
@@ -406,13 +420,17 @@ def request_render(jid, cid, changes: dict):
         )
         if not 3 <= new["end"] - new["start"] <= max_dur:
             raise ValueError(f"A clip can be 3 to {max_dur} seconds long.")
-        for k in ("hook", "title", "description", "style", "layout", "thumb_text"):
+        for k in ("hook", "title", "description", "style", "layout", "thumb_text", "thumb_mode"):
             if k in changes:
-                new[k] = str(changes[k])[:{"hook": 60, "title": 100, "description": 2000, "thumb_text": 40}.get(k, 20)]
+                new[k] = str(changes[k])[:{"hook": 60, "title": 100, "description": 2000, "thumb_text": 40, "thumb_mode": 10}.get(k, 20)]
         if new.get("style") not in render.STYLES:
             new["style"] = DEFAULTS["style"]
         if new.get("layout") not in render.LAYOUTS:
             new["layout"] = DEFAULTS["layout"]
+        if "layout" in changes:
+            new["format"] = "16:9" if new["layout"] == "horizontal" else "9:16"
+        if new.get("thumb_mode") not in ("local", "ai"):
+            new["thumb_mode"] = job.get("options", {}).get("thumb_mode", DEFAULTS["thumb_mode"])
         has_clip_src = bool(clip.get("src") and Path(clip["src"]).is_file())
         has_job_src = bool(job.get("source_path") and Path(job["source_path"]).is_file())
         has_url_src = (
@@ -434,27 +452,110 @@ def request_render(jid, cid, changes: dict):
     _q.put(("clip", jid, cid))
 
 
+def _next_id(job, prefix: str) -> str:
+    n = 0
+    for c in job.get("clips", []):
+        cid = str(c.get("id") or "")
+        if cid.startswith(prefix) and cid[len(prefix):].isdigit():
+            n = max(n, int(cid[len(prefix):]))
+    return f"{prefix}{n + 1:02d}"
+
+
+def _norm_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    u = urlparse(raw)
+    host = (u.hostname or "").lower()
+    if host in ("youtube.com", "youtu.be") or host.endswith((".youtube.com", ".youtu.be")):
+        if host.endswith("youtu.be"):
+            vid = u.path.strip("/").split("/")[0]
+            if vid:
+                return f"yt:{vid}"
+        qs = parse_qs(u.query)
+        if qs.get("v"):
+            return f"yt:{qs['v'][0]}"
+        m = re.search(r"/(?:live|shorts|embed|v)/([\w-]{6,})", u.path)
+        if m:
+            return f"yt:{m.group(1)}"
+    return f"{host}{u.path.rstrip('/')}"
+
+
+def _find_cached_job(job, lo_s: float, hi_s: float) -> dict | None:
+    uid = job.get("user")
+    target = _norm_url((job.get("source") or {}).get("url") or "")
+    if not uid or not target:
+        return None
+    with _lock:
+        cands = list((_by_user.get(uid) or {}).values())
+    for other in sorted(cands, key=lambda x: -float(x.get("created") or 0)):
+        if other.get("id") == job.get("id") or other.get("kind") == "live":
+            continue
+        if _norm_url((other.get("source") or {}).get("url") or "") != target:
+            continue
+        wf = Path(other["dir"]) / "words.json"
+        if not wf.is_file():
+            continue
+        try:
+            words = json.loads(wf.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        if words and _covers(words, lo_s, hi_s):
+            return other
+    return None
+
+
+def _reuse_cached_src(job, clip) -> bool:
+    """Reuse an already downloaded .src.mp4 segment from another clip in the same job when it covers [start, end]."""
+    cs, ce = float(clip["start"]), float(clip["end"])
+    for prev in job.get("clips", []):
+        if prev is clip or not prev.get("src"):
+            continue
+        p = Path(prev["src"])
+        if not p.is_file():
+            continue
+        off = prev.get("src_offset")
+        end = prev.get("src_end")
+        if off is None or end is None:
+            continue
+        if float(off) <= cs + 0.05 and float(end) >= ce - 0.05:
+            clip.update(src=str(p), src_offset=float(off), src_end=float(end))
+            clip["start"] = max(cs, float(off))
+            clip["end"] = min(ce, float(end))
+            return True
+    return False
+
+
 def render_one(job, clip, words):
     d = Path(job["dir"])
     clip["status"] = "rendering"
     save(job)
     try:
-        has_clip_src = bool(clip.get("src") and Path(clip["src"]).is_file())
-        has_job_src = bool(job.get("source_path") and Path(job["source_path"]).is_file())
-        if not has_clip_src and not has_job_src and (
-            (not clip.get("src") and not job.get("source_path"))
-            or (job.get("source") or {}).get("type") == "url"
-        ):
-            _piece_again(job, clip)
+        segs = clip.get("segments") or []
+        segs_ready = bool(segs) and all(s.get("src") and Path(s["src"]).is_file() for s in segs)
+        if segs_ready:
+            src = Path(segs[0]["src"])
+            off = 0.0
+            local = dict(clip, hook=roman.to_roman(clip.get("hook") or ""))
+        else:
             has_clip_src = bool(clip.get("src") and Path(clip["src"]).is_file())
-        use_clip_src = has_clip_src or bool(clip.get("src") and not has_job_src)
-        off = clip.get("src_offset", 0.0) if use_clip_src else 0.0
-        src = Path(clip["src"]) if use_clip_src else Path(job["source_path"])
-        if not use_clip_src:
-            clip["end"] = min(clip["end"], job["duration"])
-        local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
-        if clip.get("segments") and off:
-            local["segments"] = [{"start": round(float(s["start"]) - off, 2), "end": round(float(s["end"]) - off, 2)} for s in clip["segments"]]
+            has_job_src = bool(job.get("source_path") and Path(job["source_path"]).is_file())
+            if not has_clip_src and not has_job_src:
+                has_clip_src = _reuse_cached_src(job, clip)
+            if not has_clip_src and not has_job_src and (
+                (not clip.get("src") and not job.get("source_path"))
+                or (job.get("source") or {}).get("type") == "url"
+            ):
+                _piece_again(job, clip)
+                has_clip_src = bool(clip.get("src") and Path(clip["src"]).is_file())
+            use_clip_src = has_clip_src or bool(clip.get("src") and not has_job_src)
+            off = clip.get("src_offset", 0.0) if use_clip_src else 0.0
+            src = Path(clip["src"]) if use_clip_src else Path(job["source_path"])
+            if not use_clip_src:
+                clip["end"] = min(clip["end"], job["duration"])
+            local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
+            if clip.get("segments") and off:
+                local["segments"] = [{"start": round(float(s["start"]) - off, 2), "end": round(float(s["end"]) - off, 2)} for s in clip["segments"]]
         is_16_9 = clip.get("format") == "16:9" or clip.get("layout") == "horizontal"
         need_caps = False if is_16_9 else clip.get("captions", True)
         near = _caption_words(job, clip, words, off) if need_caps else []
@@ -462,7 +563,7 @@ def render_one(job, clip, words):
         dc_path = covers.cover_file(job.get("creator"), wide=is_16_9)
         dc_first = False if is_16_9 else bool(covers.should_inject_first_frame(job.get("creator")))
         rc_kw = {"default_cover": dc_path, "cover_first_frame": dc_first} if dc_path else {}
-        out = render.render_clip(src, d / "clips", clip["id"], local, near, job["width"], job["height"], **rc_kw)
+        out = render.render_clip(src, d / "clips", clip["id"], local, near, job.get("width") or 1280, job.get("height") or 720, **rc_kw)
         now_ts = time.time()
         clip.update(out, status="done", version=clip.get("version", 0) + 1, error=None, rendered_at=now_ts)
         if clip["version"] > 1:
@@ -565,6 +666,7 @@ def _piece_again(job, clip):
     if src.get("type") != "url" or not src.get("url"):
         raise RuntimeError("The original video is no longer here, so this clip can't be made again. Add the video again.")
     d = Path(job["dir"])
+    (d / "clips").mkdir(parents=True, exist_ok=True)
     want = max(0.0, clip["start"] - PAD)
     until = clip["end"] + PAD if not job.get("duration") else min(job["duration"], clip["end"] + PAD)
     try:
@@ -633,8 +735,77 @@ def _facecam(job) -> list | None:
     return job["facecam"]
 
 
+def _save_loudness(d: Path, lo_s: float, db):
+    try:
+        vals = [round(float(x), 2) for x in db]
+        (d / "loudness.json").write_text(json.dumps({"offset": round(float(lo_s), 2), "db": vals}), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _load_loudness(d: Path, lo_s: float, hi_s: float):
+    span_len = max(1, int(math.ceil(max(0.0, hi_s - lo_s))) + 1)
+    lf = d / "loudness.json"
+    if lf.is_file():
+        try:
+            raw = json.loads(lf.read_text(encoding="utf-8"))
+            off = float(raw.get("offset", 0.0))
+            arr = raw.get("db") or []
+            if lo_s >= off and arr:
+                s0 = int(lo_s - off)
+                sliced = arr[s0: s0 + span_len]
+                if len(sliced) >= min(span_len, 10):
+                    out = np.zeros(span_len, dtype=np.float32)
+                    n = min(len(sliced), span_len)
+                    out[:n] = np.asarray(sliced[:n], dtype=np.float32)
+                    return out
+        except Exception:  # noqa: BLE001
+            pass
+    return np.zeros(span_len, dtype=np.float32)
+
+
+def _queue_found_clips(job, found, shift: float, o: dict, statics: list, notes: list, face,
+                       renders, futures, make_fn, words: list) -> tuple[list, object]:
+    if found and statics:
+        keep = []
+        for c in found:
+            a_s, b_s = c["start"] + shift, c["end"] + shift
+            inside = quality.static_overlap(a_s, b_s, statics)
+            if inside > 0.5 * max(1.0, b_s - a_s):
+                notes.append(f"A clip from {round(a_s)}s was left out: it sat in an ad break or a static screen.")
+            else:
+                keep.append(c)
+        found = keep
+    created = []
+    is_16_9 = o.get("layout") == "horizontal"
+    for c in found:
+        cs, ce = round(c["start"] + shift, 2), round(c["end"] + shift, 2)
+        c.update(
+            id=_next_id(job, "clip"),
+            start=cs,
+            end=ce,
+            style=o["style"],
+            layout=o["layout"],
+            captions=(False if is_16_9 else o.get("captions", True)),
+            output_lang=o.get("output_lang", config.OUTPUT_LANG),
+            thumb_mode=o.get("thumb_mode", "local"),
+            status="queued",
+            version=0,
+        )
+        if is_16_9:
+            c["format"] = "16:9"
+            c["peak_t"] = round((cs + ce) / 2, 2)
+        if o["layout"] == "gameplay" and face is False:
+            face = _facecam(job)
+        if face:
+            c["facecam"] = face
+        job["clips"].append(c)
+        created.append(c)
+        futures.append((renders.submit(ctx.bind(make_fn), c, list(words)), c))
+    return created, face
+
+
 def _run_job(job):
-    import math
     from concurrent.futures import ThreadPoolExecutor
     d = Path(job["dir"])
     o = job["options"]
@@ -667,6 +838,9 @@ def _run_job(job):
         _set(job, stage="Getting the audio")
     fetch = ThreadPoolExecutor(1)
     video = None
+    audio = None
+    cached_job = None
+    pieces = False
     if src["type"] == "url":
         meta = media.info(src["url"])
         if meta["kind"] != "video":
@@ -680,11 +854,16 @@ def _run_job(job):
         if not job.get("thumb") and media.save_thumb(d, url=src["url"]):
             _set(job, thumb=True)
         usage.set_context(job["creator"], meta["title"])
-        span = (o["range_end"] or meta["duration"]) - (o["range_start"] or 0)
-        pieces = span > LONG_VIDEO or meta["duration"] <= 0
-        if not pieces:  # shorter video: fetch all of it in the background while the audio is worked on
-            video = fetch.submit(media.download, src["url"], d, int(o["quality"]))
-        audio_file = media.download_audio(src["url"], d, lambda p: _set(job, progress=0.03 + 0.1 * p))
+        lo_s = float(o["range_start"] or 0.0)
+        hi_s = float(o["range_end"] or meta["duration"] or 0.0)
+        if not resuming and hi_s > lo_s:
+            cached_job = _find_cached_job(job, lo_s, hi_s)
+        span = hi_s - lo_s
+        pieces = bool(cached_job) or span > LONG_VIDEO or meta["duration"] <= 0
+        if not cached_job:
+            if not pieces:  # shorter video: fetch all of it in the background while the audio is worked on
+                video = fetch.submit(media.download, src["url"], d, int(o["quality"]))
+            audio_file = media.download_audio(src["url"], d, lambda p: _set(job, progress=0.03 + 0.1 * p))
     else:
         pieces, audio_file = False, Path(src["path"])
         info = media.probe(audio_file)
@@ -693,18 +872,33 @@ def _run_job(job):
         _set(job, source_path=str(audio_file), width=info["width"], height=info["height"], duration=info["duration"])
         if not job.get("thumb") and media.save_thumb(d, video=audio_file):
             _set(job, thumb=True)
-    wav = d / "audio.wav"
-    media.extract_audio(audio_file, wav)
-    audio = media.load_audio(wav)
-    wav.unlink(missing_ok=True)
-    if src["type"] == "url":
-        audio_file.unlink(missing_ok=True)
-    if not job["duration"]:
-        job["duration"] = len(audio) / 16000
-    lo = int((o["range_start"] or 0) * 16000)
-    hi = min(len(audio), int(o["range_end"] * 16000)) if o["range_end"] else len(audio)
-    span = (hi - lo) / 16000
-    db = media.loudness_per_second(audio[lo:hi])
+    if cached_job:
+        cdir = Path(cached_job["dir"])
+        words = json.loads((cdir / "words.json").read_text(encoding="utf-8"))
+        (d / "words.json").write_text(json.dumps(words), encoding="utf-8")
+        if cached_job.get("lang"):
+            job["lang"] = cached_job["lang"]
+        job["transcript_from"] = "cache"
+        lo_s = float(o["range_start"] or 0.0)
+        hi_s = min(float(job.get("duration") or words[-1]["e"]), float(o["range_end"] or job.get("duration") or words[-1]["e"]))
+        lo, hi = int(lo_s * 16000), int(hi_s * 16000)
+        span = max(0.0, hi_s - lo_s)
+        db = _load_loudness(cdir, lo_s, hi_s)
+        _save_loudness(d, lo_s, db)
+    else:
+        wav = d / "audio.wav"
+        media.extract_audio(audio_file, wav)
+        audio = media.load_audio(wav)
+        wav.unlink(missing_ok=True)
+        if src["type"] == "url":
+            audio_file.unlink(missing_ok=True)
+        if not job["duration"]:
+            job["duration"] = len(audio) / 16000
+        lo = int((o["range_start"] or 0) * 16000)
+        hi = min(len(audio), int(o["range_end"] * 16000)) if o["range_end"] else len(audio)
+        span = (hi - lo) / 16000
+        db = media.loudness_per_second(audio[lo:hi])
+        _save_loudness(d, lo / 16000, db)
 
     vlock, vstate = threading.Lock(), {}
 
@@ -730,12 +924,19 @@ def _run_job(job):
     exact = {}      # clip id -> (from, to, words): our own model's words for just that clip
 
     began = {}      # clip id -> when work on it started
+    yt = None
 
     def make(clip, words_now):
         began[clip["id"]] = time.time()
-        if src["type"] == "url" and (pieces or not whole_video()):
-            _fetch_piece(job, clip, audio)
-        if clip["status"] != "error" and clip.get("captions", True) and yt and yt[1].lower().startswith(("en", "pt")):
+        if src["type"] == "url" and not _reuse_cached_src(job, clip) and (pieces or audio is None or not whole_video()):
+            if audio is not None and len(audio):
+                _fetch_piece(job, clip, audio)
+            else:
+                try:
+                    _piece_again(job, clip)
+                except Exception as e:  # noqa: BLE001
+                    clip.update(status="error", error=safe.friendly(e, 250))
+        if audio is not None and clip["status"] != "error" and clip.get("captions", True) and yt and yt[1].lower().startswith(("en", "pt")):
             # The clip was found with YouTube's transcript. What is shown on screen comes from our own model,
             # run on just this clip: full punctuation, nothing blanked out, timings to the word.
             a0, b0 = max(lo, int((clip["start"] - 1.5) * 16000)), min(hi, int((clip["end"] + 1.5) * 16000))
@@ -752,114 +953,104 @@ def _run_job(job):
     cpus = os.cpu_count() or 4
     renders = ThreadPoolExecutor(2 if cpus < 8 else min(6, cpus // 6))  # more clips made at once on a bigger machine
     futures = []
-    step = BLOCK * 16000 if span > PROGRESSIVE_FROM else hi - lo
-    blocks = [(x, min(hi, x + step)) for x in range(lo, hi, step)] or [(lo, hi)]
-    words, tokens, model = [], 0, None
-    done_blocks = 0
-    yt = None
-    if src["type"] == "url" and config.YT_TRANSCRIPT and media.is_youtube(src["url"]):
-        try:
-            yt = media.youtube_words(src["url"])
-        except Exception:  # noqa: BLE001 - no transcript to borrow: ours is written as usual
-            yt = None
-        if yt and not _covers(yt[0], lo / 16000, hi / 16000):
-            yt = None
-        job["transcript_from"] = "youtube" if yt else "own"
-        job["lang"] = yt[1] if yt else ""          # the language spoken, when YouTube says (decides the captions)
-    if resuming:
-        try:
-            words = json.loads((d / "words.json").read_text(encoding="utf-8"))
-        except ValueError:
-            words = []
-        done_blocks = min(int(job.get("done_blocks", 0)), len(blocks)) if words else 0
-        tokens, model = int((job.get("ai") or {}).get("tokens", 0)), (job.get("ai") or {}).get("model")
-        if done_blocks < len(blocks):     # words past the last finished part are transcribed again
-            cut = blocks[done_blocks][0] / 16000
-            words = [w for w in words if w["s"] < cut]
-        for c in job["clips"]:            # clips found before the restart that were not finished yet
-            if c.get("status") not in ("done", "error"):
-                c["status"] = "queued"
-                futures.append((renders.submit(ctx.bind(make), c, list(words)), c))
-        save(job)
-    # The transcript of the next part is written while the AI is still reading this one (the AI is a wait on the
-    # network, the transcript is work on this machine), so neither waits for the other.
     ahead = ThreadPoolExecutor(2, thread_name_prefix="ahead")
-    heard, now_on = {}, [done_blocks]
-
-    def hear(i):
-        if i < len(blocks) and i >= done_blocks and i not in heard:
-            a_, b_ = blocks[i]
-            last = [0.0]
-
-            def tp(p, i=i, a_=a_, b_=b_):
-                if now_on[0] == i and p - last[0] > 0.05:      # only the part being shown moves the bar
-                    last[0] = p
-                    _set(job, progress=max(job["progress"], 0.14 + 0.78 * ((a_ - lo) + p * (b_ - a_)) / max(1, hi - lo)))
-            heard[i] = ahead.submit(ctx.bind(transcribe.transcribe), audio[a_:b_], tp)
-
-    # The ad breaks and static screens of the whole video, found once. It reads the video end to end,
-    # so it is done here rather than for each clip, and only when asked for.
+    tokens, model = 0, None
     statics = quality.static_ranges(job.get("source_path") or "") if config.SKIP_STATIC else []
-    for bi, (a, b) in enumerate(blocks):
-        if bi < done_blocks:
-            continue                      # transcribed and checked by the AI before the restart
-        shift = a / 16000
-        where = f" (minute {round((a - lo) / 16000 / 60)} of {round(span / 60)})" if len(blocks) > 1 else ""
-        if yt:
-            _set(job, stage="Reading the transcript" + where)
-            bw = [dict(w, s=round(w["s"] - shift, 2), e=round(w["e"] - shift, 2)) for w in yt[0] if a / 16000 <= w["s"] < b / 16000]
-        else:
-            _set(job, stage="Writing the transcript" + where)
-            now_on[0] = bi
-            hear(bi)
-            hear(bi + 1)
-            bw = heard.pop(bi).result()
-        _set(job, progress=max(job["progress"], 0.14 + 0.78 * (b - lo) / max(1, hi - lo)))
-        words += [dict(w, s=round(w["s"] + shift, 2), e=round(w["e"] + shift, 2)) for w in bw]
-        (d / "words.json").write_text(json.dumps(words), encoding="utf-8")
-        _set(job, stage="Finding the best moments" + where, word_count=len(words))
-        left = int(o["max_clips"]) - len(job["clips"])
-        if left <= 0 or len(bw) < 8:
-            job["done_blocks"] = bi + 1
-            save(job)
-            continue
-        quota = max(1, math.ceil(left / (len(blocks) - bi)))
-        s0 = int((a - lo) / 16000)
-        found, ai = brain.find_clips(bw, db[s0: s0 + int((b - a) / 16000) + 1], (b - a) / 16000, job["title"],
-                                     job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), notes.append, game=game,
-                                     output_lang=o.get("output_lang", config.OUTPUT_LANG))
-        tokens += ai.get("tokens", 0)
-        model = ai.get("model") or model
-        if ai.get("note"):
-            notes.append(ai["note"])
-        if found and statics:
-            # A commercial or a "be right back" slate is not a clip. Any clip that sits mostly inside one
-            # is dropped.
-            keep = []
-            for c in found:
-                a_s, b_s = c["start"] + shift, c["end"] + shift
-                inside = quality.static_overlap(a_s, b_s, statics)
-                if inside > 0.5 * max(1.0, b_s - a_s):
-                    notes.append(f"A clip from {round(a_s)}s was left out: it sat in an ad break or a static screen.")
-                else:
-                    keep.append(c)
-            found = keep
-        for c in found:
-            c.update(id=f"clip{len(job['clips']) + 1:02d}", start=round(c["start"] + shift, 2),
-                     end=round(c["end"] + shift, 2), style=o["style"], layout=o["layout"],
-                     captions=o.get("captions", True), output_lang=o.get("output_lang", config.OUTPUT_LANG),
-                     status="queued", version=0)
-            # Only the gameplay layout uses a webcam, so it is only looked for then, and only once: a
-            # stream with no webcam is not looked for again on every clip of it.
-            if o["layout"] == "gameplay" and face is False:
-                face = _facecam(job)
-            if face:
-                c["facecam"] = face
-            job["clips"].append(c)
-            futures.append((renders.submit(ctx.bind(make), c, list(words)), c))
+
+    if cached_job:
+        _set(job, stage="Using cached transcript to find clips", progress=0.55, word_count=len(words))
+        lo_s = lo / 16000
+        hi_s = hi / 16000
+        bw = [dict(w, s=round(w["s"] - lo_s, 2), e=round(w["e"] - lo_s, 2)) for w in words if lo_s <= w["s"] <= hi_s]
+        if len(bw) >= 8:
+            found, ai = brain.find_clips(bw, db, span, job["title"], job["uploader"], int(o["max_clips"]),
+                                         int(o["min_len"]), int(o["max_len"]), notes.append, game=game,
+                                         output_lang=o.get("output_lang", config.OUTPUT_LANG))
+            tokens += ai.get("tokens", 0)
+            model = ai.get("model") or model
+            if ai.get("note"):
+                notes.append(ai["note"])
+            _, face = _queue_found_clips(job, found, lo_s, o, statics, notes, face, renders, futures, make, words)
         job["ai"] = {"model": model, "tokens": tokens, "note": "", "log": notes[-5:]}
-        job["done_blocks"] = bi + 1       # a restart from here on carries on with the next part
         save(job)
+    else:
+        step = BLOCK * 16000 if span > PROGRESSIVE_FROM else hi - lo
+        blocks = [(x, min(hi, x + step)) for x in range(lo, hi, step)] or [(lo, hi)]
+        words = []
+        done_blocks = 0
+        if src["type"] == "url" and config.YT_TRANSCRIPT and media.is_youtube(src["url"]):
+            try:
+                yt = media.youtube_words(src["url"])
+            except Exception:  # noqa: BLE001 - no transcript to borrow: ours is written as usual
+                yt = None
+            if yt and not _covers(yt[0], lo / 16000, hi / 16000):
+                yt = None
+            job["transcript_from"] = "youtube" if yt else "own"
+            job["lang"] = yt[1] if yt else ""          # the language spoken, when YouTube says (decides the captions)
+        if resuming:
+            try:
+                words = json.loads((d / "words.json").read_text(encoding="utf-8"))
+            except ValueError:
+                words = []
+            done_blocks = min(int(job.get("done_blocks", 0)), len(blocks)) if words else 0
+            tokens, model = int((job.get("ai") or {}).get("tokens", 0)), (job.get("ai") or {}).get("model")
+            if done_blocks < len(blocks):     # words past the last finished part are transcribed again
+                cut = blocks[done_blocks][0] / 16000
+                words = [w for w in words if w["s"] < cut]
+            for c in job["clips"]:            # clips found before the restart that were not finished yet
+                if c.get("status") not in ("done", "error"):
+                    c["status"] = "queued"
+                    futures.append((renders.submit(ctx.bind(make), c, list(words)), c))
+            save(job)
+        heard, now_on = {}, [done_blocks]
+
+        def hear(i):
+            if i < len(blocks) and i >= done_blocks and i not in heard:
+                a_, b_ = blocks[i]
+                last = [0.0]
+
+                def tp(p, i=i, a_=a_, b_=b_):
+                    if now_on[0] == i and p - last[0] > 0.05:      # only the part being shown moves the bar
+                        last[0] = p
+                        _set(job, progress=max(job["progress"], 0.14 + 0.78 * ((a_ - lo) + p * (b_ - a_)) / max(1, hi - lo)))
+                heard[i] = ahead.submit(ctx.bind(transcribe.transcribe), audio[a_:b_], tp)
+
+        for bi, (a, b) in enumerate(blocks):
+            if bi < done_blocks:
+                continue                      # transcribed and checked by the AI before the restart
+            shift = a / 16000
+            where = f" (minute {round((a - lo) / 16000 / 60)} of {round(span / 60)})" if len(blocks) > 1 else ""
+            if yt:
+                _set(job, stage="Reading the transcript" + where)
+                bw = [dict(w, s=round(w["s"] - shift, 2), e=round(w["e"] - shift, 2)) for w in yt[0] if a / 16000 <= w["s"] < b / 16000]
+            else:
+                _set(job, stage="Writing the transcript" + where)
+                now_on[0] = bi
+                hear(bi)
+                hear(bi + 1)
+                bw = heard.pop(bi).result()
+            _set(job, progress=max(job["progress"], 0.14 + 0.78 * (b - lo) / max(1, hi - lo)))
+            words += [dict(w, s=round(w["s"] + shift, 2), e=round(w["e"] + shift, 2)) for w in bw]
+            (d / "words.json").write_text(json.dumps(words), encoding="utf-8")
+            _set(job, stage="Finding the best moments" + where, word_count=len(words))
+            left = int(o["max_clips"]) - len(job["clips"])
+            if left <= 0 or len(bw) < 8:
+                job["done_blocks"] = bi + 1
+                save(job)
+                continue
+            quota = max(1, math.ceil(left / (len(blocks) - bi)))
+            s0 = int((a - lo) / 16000)
+            found, ai = brain.find_clips(bw, db[s0: s0 + int((b - a) / 16000) + 1], (b - a) / 16000, job["title"],
+                                         job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), notes.append, game=game,
+                                         output_lang=o.get("output_lang", config.OUTPUT_LANG))
+            tokens += ai.get("tokens", 0)
+            model = ai.get("model") or model
+            if ai.get("note"):
+                notes.append(ai["note"])
+            _, face = _queue_found_clips(job, found, shift, o, statics, notes, face, renders, futures, make, words)
+            job["ai"] = {"model": model, "tokens": tokens, "note": "", "log": notes[-5:]}
+            job["done_blocks"] = bi + 1       # a restart from here on carries on with the next part
+            save(job)
     long_enq, long_tok, long_model = _apply_long_and_derived(job, words, db, span, lo, game, notes, face=face, audio=audio)
     tokens += long_tok
     model = long_model or model
@@ -902,9 +1093,9 @@ def _span_has_music(words, audio, start: float, end: float, candidate: dict | No
 
 
 def _spawn_shorts_for_span(job, words, db, lo, span_start: float, span_end: float, base_title: str,
-                           base_hashtags: list, game, notes: list, face=None, reason: str = "") -> tuple[list, int, str | None]:
+                           base_hashtags: list, game, notes: list, face=None, reason: str = "", opts: dict | None = None) -> tuple[list, int, str | None]:
     """Create 9:16 Shorts/Reels from a segment blocked from long upload due to >5s music."""
-    o = job["options"]
+    o = opts or job["options"]
     out_lang = o.get("output_lang", config.OUTPUT_LANG)
     shift_lo = lo / 16000
     max_short_len = min(60, max(15, int(o.get("max_len", 60))))
@@ -947,7 +1138,7 @@ def _spawn_shorts_for_span(job, words, db, lo, span_start: float, span_end: floa
     enqueued = []
     for sc in created_raw[:short_cap]:
         sc.update(
-            id=f"clip{len(job['clips']) + 1:02d}",
+            id=_next_id(job, "clip"),
             style=o["style"],
             layout=o["layout"],
             format="9:16",
@@ -955,6 +1146,7 @@ def _spawn_shorts_for_span(job, words, db, lo, span_start: float, span_end: floa
             music_reason=reason,
             captions=o.get("captions", True),
             output_lang=out_lang,
+            thumb_mode=o.get("thumb_mode", "local"),
             status="queued",
             version=0,
         )
@@ -965,9 +1157,9 @@ def _spawn_shorts_for_span(job, words, db, lo, span_start: float, span_end: floa
     return enqueued, tok, model
 
 
-def _apply_long_and_derived(job, words, db, span, lo, game, notes, face=None, audio=None):
+def _apply_long_and_derived(job, words, db, span, lo, game, notes, face=None, audio=None, opts: dict | None = None, exclude_long=()):
     """Generate 16:9 long blocks, derived 9:16 Shorts (parent_clip), and 16:9 compilations after blocks finish."""
-    o = job["options"]
+    o = opts or job["options"]
     long_mode = o.get("long_mode", "off")
     if long_mode == "off":
         return [], 0, None
@@ -976,6 +1168,11 @@ def _apply_long_and_derived(job, words, db, span, lo, game, notes, face=None, au
     out_lang = o.get("output_lang", config.OUTPUT_LANG)
     shift_lo = lo / 16000
     enqueued, tokens, model = [], 0, None
+    rel_excl = [
+        {"start": max(0.0, float(x["start"]) - shift_lo), "end": max(0.0, float(x["end"]) - shift_lo)}
+        for x in (exclude_long or ())
+        if float(x.get("end", 0)) > shift_lo
+    ]
     if long_mode in ("block", "both") and span >= long_min_len and len(words) >= 20:
         shifted_words = (
             [dict(w, s=round(w["s"] - shift_lo, 2), e=round(w["e"] - shift_lo, 2)) for w in words]
@@ -984,13 +1181,12 @@ def _apply_long_and_derived(job, words, db, span, lo, game, notes, face=None, au
         blocks, ai_long = brain.find_long_blocks(
             shifted_words, db, span, job["title"], job["uploader"],
             max_blocks=2, min_len=long_min_len, max_len=long_max_len,
-            log=notes.append, game=game, output_lang=out_lang,
+            log=notes.append, game=game, output_lang=out_lang, exclude=rel_excl,
         )
         tokens += ai_long.get("tokens", 0)
         model = ai_long.get("model") or model
         if ai_long.get("note"):
             notes.append(ai_long["note"])
-        long_idx = 0
         for b in blocks:
             abs_s = round(b["start"] + shift_lo, 2)
             abs_e = round(b["end"] + shift_lo, 2)
@@ -1002,15 +1198,14 @@ def _apply_long_and_derived(job, words, db, span, lo, game, notes, face=None, au
                 sp_enq, sp_tok, sp_mod = _spawn_shorts_for_span(
                     job, words, db, lo, abs_s, abs_e,
                     b.get("title") or job.get("title", ""), b.get("hashtags") or [],
-                    game, notes, face=face, reason=music_why,
+                    game, notes, face=face, reason=music_why, opts=o,
                 )
                 enqueued.extend(sp_enq)
                 tokens += sp_tok
                 model = sp_mod or model
                 continue
-            long_idx += 1
             b.update(
-                id=f"long{long_idx:02d}",
+                id=_next_id(job, "long"),
                 start=abs_s,
                 end=abs_e,
                 peak_t=round(b.get("peak_t", b["start"]) + shift_lo, 2),
@@ -1057,7 +1252,7 @@ def _apply_long_and_derived(job, words, db, span, lo, game, notes, face=None, au
                         model = ai_sub.get("model") or model
                         for sc in sub_clips:
                             sc.update(
-                                id=f"clip{len(job['clips']) + 1:02d}",
+                                id=_next_id(job, "clip"),
                                 start=round(sc["start"] + b["start"], 2),
                                 end=round(sc["end"] + b["start"], 2),
                                 style=o["style"],
@@ -1066,6 +1261,7 @@ def _apply_long_and_derived(job, words, db, span, lo, game, notes, face=None, au
                                 parent_clip=b["id"],
                                 captions=o.get("captions", True),
                                 output_lang=out_lang,
+                                thumb_mode=o.get("thumb_mode", "local"),
                                 status="queued",
                                 version=0,
                             )
@@ -1089,8 +1285,21 @@ def _apply_long_and_derived(job, words, db, span, lo, game, notes, face=None, au
             min_len=long_min_len, max_len=long_max_len, game=game, output_lang=out_lang,
         )
         if comp:
+            for seg in comp.get("segments") or []:
+                match = next(
+                    (
+                        c for c in short_cands
+                        if c.get("src") and Path(c["src"]).is_file()
+                        and float(c.get("src_offset", c["start"])) <= float(seg["start"]) + 0.05
+                        and float(c.get("src_end", c["end"])) >= float(seg["end"]) - 0.05
+                    ),
+                    None,
+                )
+                if match:
+                    seg["src"] = match["src"]
+                    seg["src_offset"] = float(match.get("src_offset", 0.0))
             comp.update(
-                id="comp01",
+                id=_next_id(job, "comp"),
                 style="clean",
                 layout="horizontal",
                 format="16:9",
@@ -1110,6 +1319,270 @@ def _apply_long_and_derived(job, words, db, span, lo, game, notes, face=None, au
     return enqueued, tokens, model
 
 
+def request_recut(jid: str, options: dict | None = None) -> dict:
+    """Queue a new round of clips on an already transcribed job using its cached words.json."""
+    with _lock:
+        job = get(jid)
+        if not job:
+            raise KeyError(jid)
+        if job.get("status") in ("queued", "running", "live"):
+            raise RuntimeError("This video is still being worked on.")
+        d = Path(job["dir"])
+        if not (d / "words.json").is_file():
+            raise ValueError("This video has no saved transcript cache yet.")
+        has_job_src = bool(job.get("source_path") and Path(job["source_path"]).is_file())
+        has_url_src = bool((job.get("source") or {}).get("type") == "url" and (job.get("source") or {}).get("url"))
+        if not (has_job_src or has_url_src):
+            raise ValueError("The original video source is not available to render new clips.")
+        raw = dict(options or {})
+        cleaned = clean_options(raw)
+        opts = {**DEFAULTS, **(job.get("options") or {}), **cleaned}
+        for rk in ("range_start", "range_end"):
+            if rk in raw and raw[rk] in (None, ""):
+                opts[rk] = None
+        if opts.get("range_end") is not None and opts["range_end"] <= (opts.get("range_start") or 0):
+            raise ValueError("The end of the chosen part must be after its start.")
+        if opts["min_len"] >= opts["max_len"]:
+            opts["min_len"] = max(5, opts["max_len"] - 5)
+        if opts["long_min_len"] >= opts["long_max_len"]:
+            opts["long_min_len"] = max(300, opts["long_max_len"] - 60)
+        opts["avoid_overlap"] = bool(raw.get("avoid_overlap", True))
+        job["pending_recut"] = opts
+        job.update(status="queued", stage="Waiting to make more clips (using cache)", error=None, progress=0.05)
+        save(job)
+    _q.put(("recut", jid, None), user=job["user"])
+    return job
+
+
+def _run_recut(job):
+    from concurrent.futures import ThreadPoolExecutor
+    d = Path(job["dir"])
+    pending = dict(job.pop("pending_recut", None) or job.get("options") or DEFAULTS)
+    avoid_overlap = bool(pending.pop("avoid_overlap", True))
+    o = {**DEFAULTS, **(job.get("options") or {}), **pending}
+    job["options"] = o
+    src = job["source"]
+    game = job.get("game") or games.detect(job.get("title", ""), src.get("name"))[0] or ""
+    t0 = time.time()
+    notes = []
+    face = job.get("facecam") if job.get("facecam") else False
+    usage.set_context(job.get("creator"), job.get("title") or src.get("name"))
+    _set(job, status="running", stage="Loading cached transcript", progress=0.1, error=None)
+
+    words = json.loads((d / "words.json").read_text(encoding="utf-8"))
+    total_dur = float(job.get("duration") or (words[-1]["e"] if words else 0.0) or 0.0)
+    if total_dur <= 0 and words:
+        total_dur = float(words[-1]["e"])
+        job["duration"] = total_dur
+    lo_s = float(o.get("range_start") or 0.0)
+    hi_s = float(o.get("range_end") or total_dur)
+    hi_s = min(total_dur, hi_s) if total_dur > 0 else hi_s
+    span = max(0.0, hi_s - lo_s)
+    db = _load_loudness(d, lo_s, hi_s)
+
+    want_16_9 = o.get("layout") == "horizontal"
+    exclude = []
+    if avoid_overlap:
+        for c in job.get("clips", []):
+            if c.get("status") == "error":
+                continue
+            c_16_9 = c.get("format") == "16:9" or c.get("layout") == "horizontal" or c.get("clip_kind") == "long"
+            if c_16_9 == want_16_9:
+                exclude.append({"start": float(c["start"]), "end": float(c["end"])})
+
+    cpus = os.cpu_count() or 4
+    renders = ThreadPoolExecutor(2 if cpus < 8 else min(6, cpus // 6))
+    futures = []
+    began = {}
+    tokens, model = 0, None
+    statics = quality.static_ranges(job.get("source_path") or "") if config.SKIP_STATIC else []
+
+    def make(clip, words_now):
+        began[clip["id"]] = time.time()
+        render_one(job, clip, words_now)
+
+    max_len_i = int(o.get("max_len", 60))
+    step_sec = span if (span <= PROGRESSIVE_FROM or max_len_i > 180) else max(float(BLOCK), float(max_len_i) * 3.0)
+    step_sec = max(1.0, step_sec)
+    blocks = []
+    cur = lo_s
+    while cur < hi_s - 0.5:
+        nxt = min(hi_s, cur + step_sec)
+        blocks.append((cur, nxt))
+        if nxt >= hi_s:
+            break
+        cur = nxt
+    if not blocks:
+        blocks = [(lo_s, hi_s)]
+
+    new_clips = []
+    target_new = int(o.get("max_clips", 6))
+    for bi, (a_s, b_s) in enumerate(blocks):
+        left = target_new - len(new_clips)
+        if left <= 0:
+            break
+        where = f" (part {bi + 1} of {len(blocks)})" if len(blocks) > 1 else ""
+        _set(job, stage="Finding new moments from cache" + where,
+             progress=max(job["progress"], 0.15 + 0.55 * (bi / max(1, len(blocks)))))
+        bw = [dict(w, s=round(w["s"] - a_s, 2), e=round(w["e"] - a_s, 2)) for w in words if a_s <= w["s"] <= b_s]
+        if len(bw) < 8:
+            continue
+        quota = max(1, math.ceil(left / (len(blocks) - bi)))
+        s0 = max(0, int(a_s - lo_s))
+        s1 = min(len(db), s0 + int(b_s - a_s) + 1)
+        rel_excl = [
+            {"start": x["start"] - a_s, "end": x["end"] - a_s}
+            for x in (exclude + new_clips)
+            if x["end"] > a_s and x["start"] < b_s
+        ]
+        found, ai_res = brain.find_clips(
+            bw, db[s0:s1], b_s - a_s, job.get("title", ""), job.get("uploader", ""),
+            quota, int(o["min_len"]), int(o["max_len"]), notes.append, game=game,
+            output_lang=o.get("output_lang", config.OUTPUT_LANG), exclude=rel_excl,
+        )
+        tokens += ai_res.get("tokens", 0)
+        model = ai_res.get("model") or model
+        if ai_res.get("note"):
+            notes.append(ai_res["note"])
+        added, face = _queue_found_clips(job, found[:left], a_s, o, statics, notes, face, renders, futures, make, words)
+        new_clips.extend(added)
+        save(job)
+
+    long_excl = [
+        {"start": float(c["start"]), "end": float(c["end"])}
+        for c in job.get("clips", [])
+        if c.get("status") != "error" and c.get("clip_kind") == "long"
+    ] if avoid_overlap else ()
+    long_enq, long_tok, long_model = _apply_long_and_derived(
+        job, words, db, span, int(lo_s * 16000), game, notes, face=face, audio=None, opts=o, exclude_long=long_excl,
+    )
+    tokens += long_tok
+    model = long_model or model
+    new_clips.extend(long_enq)
+    for c in long_enq:
+        futures.append((renders.submit(ctx.bind(make), c, list(words)), c))
+    if long_enq:
+        save(job)
+    if futures:
+        _set(job, stage="Rendering new clips from cache", progress=0.85)
+    _wait_for_clips(job, futures, began, renders._max_workers)
+    renders.shutdown(wait=False)
+    job["ai"] = {
+        "model": model,
+        "tokens": int((job.get("ai") or {}).get("tokens", 0)) + tokens,
+        "log": notes[-5:],
+        "note": "The AI was unavailable, so new clips were picked by loudness only." if new_clips and not model else "",
+    }
+    n_new = len(new_clips)
+    stage = (f"Pronto (+{n_new} {'novo corte' if n_new == 1 else 'novos cortes'} do cache)" if n_new
+             else "Nenhum corte novo encontrado nesse trecho (tente outro intervalo ou desmarque evitar repetição)")
+    _set(job, status="done", stage=stage, progress=1.0, took=round(time.time() - t0))
+    return job
+
+
+_THUMB_FRACS = (0.50, 0.22, 0.78, 0.35, 0.65, 0.14, 0.86, 0.43, 0.58, 0.28, 0.72)
+
+
+def regenerate_thumb(jid: str, cid: str, text: str | None = None, mode: str | None = None,
+                     peak_t: float | None = None, collage: bool = True, new_variant: bool = True) -> dict:
+    """Quickly regenerate a clip's 1280x720 JPEG cover without re-encoding the clip video."""
+    job = get(jid)
+    if not job:
+        raise KeyError(jid)
+    clip = next((c for c in job["clips"] if c["id"] == cid), None)
+    if not clip:
+        raise KeyError(cid)
+    if clip.get("status") in ("queued", "rendering"):
+        raise RuntimeError("This clip is still being made. Try again when it finishes.")
+    d = Path(job["dir"])
+    clips_dir = d / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+
+    using = "file"
+    src_file = None
+    temp_src_for_drive = False
+    if clip.get("src") and Path(clip["src"]).is_file():
+        src_file = Path(clip["src"])
+        using = "src"
+    elif job.get("source_path") and Path(job["source_path"]).is_file():
+        src_file = Path(job["source_path"])
+        using = "job"
+    elif clip.get("file") and (clips_dir / Path(str(clip["file"])).name).is_file():
+        src_file = clips_dir / Path(str(clip["file"])).name
+        using = "file"
+    elif (job.get("source") or {}).get("type") == "url" and (job.get("source") or {}).get("url"):
+        _piece_again(job, clip)
+        if clip.get("src") and Path(clip["src"]).is_file():
+            src_file = Path(clip["src"])
+            using = "src"
+            temp_src_for_drive = bool(clip.get("drive"))
+    if not src_file or not src_file.is_file():
+        raise ValueError("No video frame source is available on disk to generate this thumbnail.")
+
+    variant = int(clip.get("thumb_variant", 0)) + 1 if new_variant else int(clip.get("thumb_variant", 0))
+    cs, ce = float(clip["start"]), float(clip["end"])
+    dur = max(0.5, ce - cs)
+    alt_abs = None
+    if peak_t is not None:
+        target_abs = float(peak_t)
+    elif new_variant:
+        frac = _THUMB_FRACS[(variant - 1) % len(_THUMB_FRACS)]
+        cycle = (variant - 1) // len(_THUMB_FRACS)
+        frac = min(0.92, max(0.08, frac + (cycle % 4) * 0.03))
+        target_abs = cs + dur * frac
+        alt_frac = 1.0 - frac
+        if abs((alt_frac - frac) * dur) < 1.5 and dur >= 4.0:
+            alt_frac = 0.85 if frac < 0.5 else 0.15
+        alt_abs = cs + dur * alt_frac
+    else:
+        target_abs = float(clip.get("peak_t") or ((cs + ce) / 2.0))
+
+    def _to_local(abs_t: float) -> float:
+        if using == "src":
+            return max(0.0, abs_t - float(clip.get("src_offset", 0.0)))
+        if using == "job":
+            return max(0.0, abs_t)
+        return max(0.0, min(max(0.2, ce - cs) - 0.1, abs_t - cs))
+
+    local_peak_t = _to_local(target_abs)
+    local_alt_t = _to_local(alt_abs) if alt_abs is not None else None
+
+    thumb_text = str(text if text is not None else (clip.get("thumb_text") or clip.get("hook") or clip.get("title") or ""))[:40]
+    thumb_mode = mode if mode in ("local", "ai") else (clip.get("thumb_mode") or (job.get("options") or {}).get("thumb_mode") or "local")
+    face = (clip.get("facecam") or job.get("facecam")) if using in ("src", "job") else None
+
+    render.install_fonts()
+    out_jpg = clips_dir / f"{cid}.jpg"
+    _, report = thumbs.generate_with_report(
+        src_file,
+        out_jpg,
+        peak_t=local_peak_t,
+        text=thumb_text,
+        facecam=face,
+        mode=thumb_mode,
+        collage=bool(collage),
+        variant=variant,
+        alt_peak_t=local_alt_t,
+    )
+    clip["thumb_text"] = thumb_text
+    clip["thumb_mode"] = thumb_mode
+    clip["thumb_variant"] = variant
+    clip["thumb_meta"] = report
+    clip["cover"] = f"{cid}.jpg"
+    clip["peak_t"] = round(target_abs, 2)
+    clip["version"] = int(clip.get("version", 0)) + 1
+    if temp_src_for_drive and src_file:
+        try:
+            src_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        clip.pop("src", None)
+        clip.pop("src_offset", None)
+        clip.pop("src_end", None)
+    save(job)
+    return job
+
+
 def _worker(quick_only=False):
     while True:
         kind, a, cid = _q.get(quick_only)
@@ -1121,13 +1594,15 @@ def _worker(quick_only=False):
             continue
         job = _jobs.get(a)
         if not job:
-            if kind == "job":
+            if kind in ("job", "recut"):
                 _q.done()
             continue
         token = ctx._uid.set(job["user"])  # everything this job does runs as its owner
         try:
             if kind == "job":
                 _run_job(job)
+            elif kind == "recut":
+                _run_recut(job)
             else:
                 clip = next(c for c in job["clips"] if c["id"] == cid)
                 words = []
@@ -1136,15 +1611,15 @@ def _worker(quick_only=False):
                 render_one(job, clip, words)
         except Exception as e:  # noqa: BLE001
             (Path(job["dir"]) / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
-            if kind == "job":
+            if kind in ("job", "recut"):
                 for c in job["clips"]:
                     if c.get("status") in ("queued", "rendering"):
                         c.update(status="error", error="The video stopped before this clip was made.")
-                _set(job, status="error", error=safe.friendly(e), stage="Stopped")
+                _set(job, status="done" if kind == "recut" else "error", error=safe.friendly(e), stage="Stopped")
                 creators.log(job["creator"], f"Video failed: {safe.friendly(e)[:200]}")
         finally:
             ctx._uid.reset(token)
-            if kind == "job":
+            if kind in ("job", "recut"):
                 _q.done()
 
 

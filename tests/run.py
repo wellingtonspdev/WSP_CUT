@@ -104,7 +104,8 @@ def main() -> int:
                 ("long videos, derived Shorts and magnetic thumbnails", ["tests/test_long_videos.py"]),
                 ("long video series", ["tests/test_long_series.py"]),
                 ("Home PT-BR, platform pause, 3-per-period cap and >5s music guard", ["tests/test_home_music_schedule.py"]),
-                ("default covers, offline remote QR, light mode, mobile dock and perf", ["tests/test_cover_remote_perf.py"])]
+                ("default covers, offline remote QR, light mode, mobile dock and perf", ["tests/test_cover_remote_perf.py"]),
+                ("cache, re-cut and thumbnail variations (32 real tests)", ["tests/test_cache_recut_thumb.py"])]
         for name, args in runs:
             print(f"\n=== {name} ===", flush=True)
             r = subprocess.run([sys.executable, *args], cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")

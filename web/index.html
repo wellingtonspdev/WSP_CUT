@@ -396,6 +396,8 @@ img.av{object-fit:cover}
 .lay-prev .ph i{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);height:16px;background:linear-gradient(135deg,#FF2E93,#36E2D0)}
 .lay-prev.zoom .ph i{left:-6px;right:-6px;height:24px}
 .lay-prev.crop .ph i{left:0;right:0;top:0;height:100%;transform:none}
+.lay-prev.horizontal .ph{width:52px;height:30px}
+.lay-prev.horizontal .ph i{left:0;right:0;top:0;height:100%;transform:none}
 .seg{display:flex;gap:4px;background:var(--surface);border-radius:10px;padding:4px}
 .composer.compact .seg{background:var(--muted)}
 .seg button{flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;padding:7px 6px;border:0;border-radius:7px;background:transparent;color:var(--dim);font-size:13px;font-weight:600;cursor:pointer;transition:background-color .15s ease,color .15s ease}
@@ -652,6 +654,19 @@ a.lnk{color:var(--brand-ink);text-decoration:none;font-weight:600}
 dialog{border:1px solid var(--line-2);background:var(--surface);color:var(--text);border-radius:var(--r-lg);padding:0;max-width:calc(100vw - 32px)}
 dialog::backdrop{background:rgba(5,3,12,.72);animation:fadein .16s ease}
 .dlg{padding:24px;width:450px;max-width:100%;display:flex;flex-direction:column;gap:14px}
+.dlg.wide{width:760px;max-width:94vw;max-height:90vh;overflow-y:auto}
+.presets{display:flex;flex-wrap:wrap;gap:6px}
+.thumb-prev{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:10px;border:1px solid var(--line);background:#111;display:block}
+.thumb-box{position:relative;border-radius:10px;overflow:hidden}
+.thumb-box.loading img{opacity:.42;filter:blur(1px);transition:opacity .2s}
+.thumb-box .thumb-spin{display:none;position:absolute;inset:0;align-items:center;justify-content:center;gap:8px;background:rgba(14,12,11,.45);color:#fff;font-size:13px;font-weight:600}
+.thumb-box.loading .thumb-spin{display:flex}
+.thumb-alert{border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.45;display:flex;flex-direction:column;gap:4px;border:1px solid var(--line);background:var(--muted)}
+.thumb-alert.warn{background:rgba(245,158,11,.12);border-color:rgba(217,119,6,.4);color:#92400E}
+.thumb-alert.bad{background:var(--bad-soft);border-color:rgba(220,38,38,.35);color:var(--bad)}
+.thumb-alert.ok{background:rgba(16,185,129,.12);border-color:rgba(5,150,105,.38);color:#065F46}
+.thumb-alert b{font-size:13px}
+.thumb-alert small{opacity:.9}
 .dlg h2{font-size:18px;font-weight:600;color:var(--brand-ink)}
 .dlg-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
 .editor{display:grid;grid-template-columns:minmax(240px,340px) minmax(300px,450px);max-height:calc(100vh - 48px)}
@@ -1978,8 +1993,76 @@ const LANG_DEFAULT = {pt: "Português (BR)", source: "Mesmo idioma", en: "Inglê
 const LANG_HINTS = {pt: "Legendas e títulos em PT-BR", source: "Manter áudio original", en: "Traduzir para inglês"};
 const langMap = () => S.status?.languages || LANG_DEFAULT;
 const defLang = () => S.status?.default_lang || "pt";
+function renderLangBlock(inputId, curLang) {
+  const langs = langMap();
+  return `<div class="ob wide"><div class="ot">Idioma de saída (legendas, ganchos e títulos)</div><input type="hidden" id="${inputId}" value="${esc(curLang)}"><div class="seg" role="group" aria-label="Idioma de saída">
+        ${Object.entries(langs).map(([k, v]) => `<button type="button" data-seg="${inputId}" data-v="${esc(k)}" aria-pressed="${k === curLang}">${esc(v)}<small>${esc(LANG_HINTS[k] || "")}</small></button>`).join("")}
+      </div></div>`;
+}
+function renderOptionsGrid(prefix, cfg, meta = {}) {
+  const curLang = cfg?.output_lang || defLang();
+  const curQual = String(cfg?.quality || 720);
+  const curThumb = cfg?.thumb_mode || "local";
+  const curLong = cfg?.long_mode || "off";
+  const fromVal = cfg?.range_start != null && cfg.range_start !== "" ? Math.round((Number(cfg.range_start) / 60) * 10) / 10 : "";
+  const toVal = cfg?.range_end != null && cfg.range_end !== "" ? Math.round((Number(cfg.range_end) / 60) * 10) / 10 : "";
+  const durHint = meta.duration ? ` (vídeo total: ${fmtLen(meta.duration)})` : "";
+  const langBlock = meta.langHtml || renderLangBlock(prefix + "lang", curLang);
+  return `<div class="og">
+      ${langBlock}
+      <div class="ob wide"><div class="ot">Modelos rápidos de corte</div><div class="presets">
+        <button type="button" class="btn sm" data-preset="${prefix}" data-min="15" data-max="60" data-layout="blur" data-cap="1">Shorts (15–60s · 9:16)</button>
+        <button type="button" class="btn sm" data-preset="${prefix}" data-min="90" data-max="150" data-layout="horizontal" data-cap="0">2 min (90–150s · 16:9)</button>
+        <button type="button" class="btn sm" data-preset="${prefix}" data-min="210" data-max="270" data-layout="horizontal" data-cap="0">4 min (210–270s · 16:9)</button>
+        <button type="button" class="btn sm" data-preset="${prefix}" data-min="270" data-max="330" data-layout="horizontal" data-cap="0">5 min (270–330s · 16:9)</button>
+      </div></div>
+      <div class="ob wide"><div class="ot">Clipes</div><div class="nsteps">
+        ${stepper(prefix + "max", "Quantidade", cfg?.max_clips ?? 6, 1, 20, 1, "")}
+        ${stepper(prefix + "min", "Mais curto", cfg?.min_len ?? 15, 5, 600, 5, "s")}
+        ${stepper(prefix + "maxlen", "Mais longo", cfg?.max_len ?? 60, 10, 900, 10, "s")}
+      </div></div>
+      <div class="ob"><div class="ot cap-head"><span id="${prefix}style_label">Estilo de legenda</span>
+        <label><input type="checkbox" id="${prefix}captions" data-caption-toggle ${cfg?.captions === false ? "" : "checked"}>Gerar legendas</label></div>
+        ${choice(prefix + "style", Object.entries(S.status.styles).map(([k, v]) => ({v:k, label:v, prev:capPrev(k)})), cfg?.style ?? "bounce", cfg?.captions === false)}</div>
+      <div class="ob"><div class="ot">Layout</div>${choice(prefix + "layout", Object.entries(S.status.layouts).map(([k, v]) => ({v:k, label:LAYOUT_SHORT[k] || v, title:v, prev:`<span class="lay-prev ${esc(k)}"><span class="ph"><i></i></span></span>`})), cfg?.layout ?? "blur")}</div>
+      <div class="ob"><div class="ot">Qualidade do vídeo</div><input type="hidden" id="${prefix}quality" value="${esc(curQual)}"><div class="seg" role="group" aria-label="Qualidade do vídeo">
+        <button type="button" data-seg="${prefix}quality" data-v="720" aria-pressed="${curQual !== "1080"}">720p<small>Rápido</small></button>
+        <button type="button" data-seg="${prefix}quality" data-v="1080" aria-pressed="${curQual === "1080"}">1080p<small>Mais nítido, ~2x mais lento</small></button></div></div>
+      <div class="ob"><div class="ot">Trecho do vídeo${esc(durHint)}</div><div class="range">
+        <label>De<input id="${prefix}from" type="number" min="0" step="0.5" value="${esc(fromVal)}" placeholder="início" aria-label="Do minuto">min</label>${ic("arrowr")}
+        <label>Até<input id="${prefix}to" type="number" min="0" step="0.5" value="${esc(toVal)}" placeholder="fim" aria-label="Até o minuto">min</label></div></div>
+      <div class="ob"><div class="ot">Estilo de thumbnail</div><input type="hidden" id="${prefix}thumb_mode" value="${esc(curThumb)}"><div class="seg" role="group" aria-label="Estilo de thumbnail">
+        <button type="button" data-seg="${prefix}thumb_mode" data-v="local" aria-pressed="${curThumb !== "ai"}">Local<small>Rápida (colagem)</small></button>
+        <button type="button" data-seg="${prefix}thumb_mode" data-v="ai" aria-pressed="${curThumb === "ai"}">IA<small>Melhor frame / Gemini</small></button></div></div>
+      <div class="ob"><div class="ot">Vídeos longos / compilação (16:9)</div><select id="${prefix}long_mode" style="width:100%;height:40px;border-radius:10px;border:1px solid var(--line);padding:0 10px;background:var(--surface);color:var(--text)">${opts({off:"Desligado (somente cortes)", block:"Blocos longos (10–20 min)", compile:"Compilação de segmentos", both:"Blocos + compilação"}, curLong)}</select></div>
+      ${meta.isRecut ? `<div class="ob wide"><label class="sw" style="margin:0"><input type="checkbox" id="${prefix}avoid" checked>Evitar repetir trechos já cortados (mesmo formato)</label></div>` : ""}
+    </div>`;
+}
+function readOptionsGrid(prefix, includeEmptyRange = false) {
+  const n = id => { const el = $(id); const v = el ? el.value : ""; return v === "" ? null : Number(v); };
+  const o = {
+    max_clips: n(`#${prefix}max`),
+    min_len: n(`#${prefix}min`),
+    max_len: n(`#${prefix}maxlen`),
+    captions: !!$(`#${prefix}captions`)?.checked,
+    output_lang: $(`#${prefix}lang`)?.value || defLang(),
+    style: $(`#${prefix}style`)?.value || "bounce",
+    layout: $(`#${prefix}layout`)?.value || "blur",
+    quality: n(`#${prefix}quality`) || 720,
+    thumb_mode: $(`#${prefix}thumb_mode`)?.value || "local",
+    long_mode: $(`#${prefix}long_mode`)?.value || "off",
+  };
+  const rFrom = n(`#${prefix}from`), rTo = n(`#${prefix}to`);
+  if (rFrom !== null) o.range_start = rFrom * 60; else if (includeEmptyRange) o.range_start = null;
+  if (rTo !== null) o.range_end = rTo * 60; else if (includeEmptyRange) o.range_end = null;
+  if ($(`#${prefix}avoid`)) o.avoid_overlap = $(`#${prefix}avoid`).checked;
+  return o;
+}
 function drawAdd(variant) {
   const c = creator(), langs = langMap(), curLang = c?.output_lang || defLang();
+  const langHtml = `<div class="ob wide"><div class="ot">Idioma de saída (legendas, ganchos e títulos)</div><input type="hidden" id="o_lang" value="${esc(curLang)}"><div class="seg" role="group" aria-label="Idioma de saída">
+        ${Object.entries(langs).map(([k, v]) => `<button type="button" data-seg="o_lang" data-v="${esc(k)}" aria-pressed="${k === curLang}">${esc(v)}<small>${esc(LANG_HINTS[k] || "")}</small></button>`).join("")}
+      </div></div>`;
   $("#add").innerHTML = `<form class="composer ${variant === "hero" ? "big" : "compact"}" id="addform">
     <div class="composer-input">${ic("link")}<input id="url" placeholder="Cole um link de vídeo do YouTube, Twitch ou Kick" autocomplete="off" aria-label="Link do vídeo"></div>
     <div class="att" id="att"><div><div class="att-in" id="attIn"></div></div></div>
@@ -1990,29 +2073,10 @@ function drawAdd(variant) {
       <span class="grow"></span><span class="hint">ou solte um arquivo de vídeo aqui</span>
       <button class="btn primary" id="goBtn">${ic("scissors")}Criar clipes</button>
     </div>
-    <div class="composer-opts" inert><div class="og">
-      <div class="ob wide"><div class="ot">Idioma de saída (legendas, ganchos e títulos)</div><input type="hidden" id="o_lang" value="${esc(curLang)}"><div class="seg" role="group" aria-label="Idioma de saída">
-        ${Object.entries(langs).map(([k, v]) => `<button type="button" data-seg="o_lang" data-v="${esc(k)}" aria-pressed="${k === curLang}">${esc(v)}<small>${esc(LANG_HINTS[k] || "")}</small></button>`).join("")}
-      </div></div>
-      <div class="ob wide"><div class="ot">Clipes</div><div class="nsteps">
-        ${stepper("o_max", "Quantidade", c?.max_clips ?? 6, 1, 20, 1, "")}
-        ${stepper("o_min", "Mais curto", c?.min_len ?? 15, 5, 120, 5, "s")}
-        ${stepper("o_maxlen", "Mais longo", c?.max_len ?? 60, 10, 180, 5, "s")}
-      </div></div>
-      <div class="ob"><div class="ot cap-head"><span id="o_style_label">Estilo de legenda</span>
-        <label><input type="checkbox" id="o_captions" data-caption-toggle ${c?.captions === false ? "" : "checked"}>Gerar legendas</label></div>
-        ${choice("o_style", Object.entries(S.status.styles).map(([k, v]) => ({v:k, label:v, prev:capPrev(k)})), c?.style ?? "bounce", c?.captions === false)}</div>
-      <div class="ob"><div class="ot">Layout</div>${choice("o_layout", Object.entries(S.status.layouts).map(([k, v]) => ({v:k, label:LAYOUT_SHORT[k] || v, title:v, prev:`<span class="lay-prev ${esc(k)}"><span class="ph"><i></i></span></span>`})), c?.layout ?? "blur")}</div>
-      <div class="ob"><div class="ot">Qualidade do vídeo</div><input type="hidden" id="o_quality" value="720"><div class="seg" role="group" aria-label="Qualidade do vídeo">
-        <button type="button" data-seg="o_quality" data-v="720" aria-pressed="true">720p<small>Rápido</small></button>
-        <button type="button" data-seg="o_quality" data-v="1080" aria-pressed="false">1080p<small>Mais nítido, ~2x mais lento</small></button></div></div>
-      <div class="ob"><div class="ot">Trecho do vídeo</div><div class="range">
-        <label>De<input id="o_from" type="number" min="0" placeholder="início" aria-label="Do minuto">min</label>${ic("arrowr")}
-        <label>Até<input id="o_to" type="number" min="0" placeholder="fim" aria-label="Até o minuto">min</label></div></div>
-    </div></div></form>`;
+    <div class="composer-opts" inert>${renderOptionsGrid("o_", c || {}, {langHtml})}</div></form>`;
   drawAtt();
 }
-const LAYOUT_SHORT = {blur:"Fundo desfocado", zoom:"Com zoom", crop:"Tela cheia", gameplay:"Gameplay + webcam"};
+const LAYOUT_SHORT = {blur:"Fundo desfocado", zoom:"Com zoom", crop:"Tela cheia", gameplay:"Gameplay + webcam", horizontal:"Horizontal 16:9"};
 const CAP_LOOK = {bounce:{font:"'Archivo Black'", hl:"#FFFF00", up:true}, hype:{font:"Anton", hl:"#FF3C3C", up:true}, clean:{font:"Poppins", hl:"#6BD7FF", up:false, w:800}};
 function capPrev(k) {
   const s = CAP_LOOK[k] || {font:"inherit", hl:"#FF8B33", up:true};
@@ -2033,8 +2097,8 @@ function stepper(id, label, val, min, max, step, unit) {
     <button type="button" data-step="${id}" data-d="1" aria-label="More">${ic("plus")}</button></div></div>`;
 }
 function choice(id, items, val, disabled = false) {
-  const captions = id === "o_style";
-  return `<input type="hidden" id="${id}" value="${esc(val)}"><div class="tiles3" role="group"${captions ? ' aria-labelledby="o_style_label"' : ""}>${items.map(x =>
+  const captions = id === "o_style" || id.endsWith("_style");
+  return `<input type="hidden" id="${id}" value="${esc(val)}"><div class="tiles3" role="group"${captions ? ` aria-labelledby="${esc(id)}_label"` : ""}>${items.map(x =>
     `<button type="button" class="tile-o" data-seg="${id}" data-v="${esc(x.v)}" aria-pressed="${String(x.v) === String(val)}"${captions ? " data-caption-style" : ""}${disabled ? " disabled" : ""}${x.title ? ` title="${esc(x.title)}"` : ""}>${x.prev}${esc(x.label)}</button>`).join("")}</div>`;
 }
 const closePicks = except => $$(".pick.open").forEach(p => { if (p !== except) { p.classList.remove("open"); p.querySelector(".pick-btn").setAttribute("aria-expanded", "false"); } });
@@ -2052,6 +2116,23 @@ document.addEventListener("click", e => {
   const sg = e.target.closest("[data-seg]");
   if (sg && !sg.disabled) { const hi = $("#" + sg.dataset.seg); hi.value = sg.dataset.v; if (sg.dataset.seg === "o_lang") hi.dataset.overridden = "true";
     sg.parentElement.querySelectorAll("[data-seg]").forEach(b => b.setAttribute("aria-pressed", String(b === sg))); return; }
+  const pr = e.target.closest("[data-preset]");
+  if (pr) {
+    const px = pr.dataset.preset;
+    if ($(`#${px}min`)) $(`#${px}min`).value = pr.dataset.min;
+    if ($(`#${px}maxlen`)) $(`#${px}maxlen`).value = pr.dataset.max;
+    const lay = pr.dataset.layout;
+    if (lay && $(`#${px}layout`)) {
+      $(`#${px}layout`).value = lay;
+      $$(`[data-seg="${px}layout"]`).forEach(b => b.setAttribute("aria-pressed", String(b.dataset.v === lay)));
+    }
+    const cap = $(`#${px}captions`);
+    if (cap && pr.dataset.cap !== undefined) {
+      cap.checked = pr.dataset.cap === "1";
+      syncCaptionStyle(cap);
+    }
+    return;
+  }
   const st = e.target.closest("[data-step]");
   if (st) { const i = $("#" + st.dataset.step), s = Number(i.step) || 1, d = Number(st.dataset.d);
     const v = Math.min(Number(i.max), Math.max(Number(i.min), (Number(i.value) || 0) + d * s)); i.value = v; }
@@ -2066,13 +2147,7 @@ document.addEventListener("keydown", e => {
   os[(i + (e.key === "ArrowDown" ? 1 : -1) + os.length) % os.length].focus();
 });
 const targetCreator = () => creatorId() || $("#o_creator")?.value || "";
-function jobOptions() {
-  const n = id => { const v = $(id).value; return v === "" ? null : Number(v); };
-  const o = {max_clips:n("#o_max"), min_len:n("#o_min"), max_len:n("#o_maxlen"), captions:$("#o_captions").checked, output_lang:$("#o_lang")?.value || defLang(), style:$("#o_style").value, layout:$("#o_layout").value, quality:n("#o_quality")};
-  if (n("#o_from") !== null) o.range_start = n("#o_from") * 60;
-  if (n("#o_to") !== null) o.range_end = n("#o_to") * 60;
-  return o;
-}
+function jobOptions() { return readOptionsGrid("o_"); }
 /* ---------- attachments: nothing starts until Make clips is pressed.
    Each page keeps its own draft (Home, All videos and every creator), so a link typed for one creator never
    shows up under another. Links move out of the box into the list as soon as they are recognised. */
@@ -2364,10 +2439,12 @@ function jobHtml(j) {
   const busy = j.status === "queued" || j.status === "running";
   const who = !creatorId() && j.creator ? S.creators.find(c => c.id === j.creator)?.name : "";
   const meta = [who, j.uploader, j.duration ? fmt(j.duration) + " long" : "", j.clips.length ? j.clips.length + (j.clips.length === 1 ? " clip" : " clips") : "",
-                j.took ? "made in " + fmt(j.took) : "", j.kind === "live" ? "recording, " + j.stage.toLowerCase() : ""].filter(Boolean).map(esc).join(" · ");
+                j.took ? "made in " + fmt(j.took) : "", j.kind === "live" ? "recording, " + j.stage.toLowerCase() : "",
+                j.has_cache ? "Cache pronto" : ""].filter(Boolean).map(esc).join(" · ");
   const pic = j.thumb ? `<img src="/media/${esc(j.id)}/thumb.jpg" alt="" loading="lazy" decoding="async">` : ic(j.source?.type === "file" ? "film" : "link");
   return `<div class="job-head"><div class="jt"><span class="jthumb">${pic}${j.duration ? `<span class="du">${fmt(j.duration)}</span>` : ""}</span><div style="min-width:0"><h3>${esc(j.title || j.source.name)}</h3><p class="sub">${meta}</p></div></div>
       <div class="row" style="flex-wrap:nowrap;gap:4px">${busy ? "" : `
+        ${j.has_cache ? `<button class="btn sm" type="button" data-act="recut" data-j="${j.id}" title="Gerar mais cortes usando a transcrição em cache">${ic("scissors")}Mais cortes</button>` : ""}
         ${j.clips.some(c => c.status === "done") ? `<button class="btn sm icon ghost" data-act="dlall" data-j="${j.id}" title="Download all clips of this video" aria-label="Download all clips of this video">${ic("down")}</button>` : ""}
         <button class="btn sm icon ghost" data-act="deljob" data-j="${j.id}" title="Delete" aria-label="Delete this video and its clips">${ic("trash")}</button>
         <label class="selck" title="Select this video and its clips"><input type="checkbox" data-sel="j:${j.id}" ${sel().has("j:" + j.id) ? "checked" : ""} aria-label="Select this video"></label>`}</div></div>
@@ -3279,6 +3356,73 @@ async function drawSettings() {
 async function saveSettings() { const d = {}; $$("#sform [data-s]").forEach(i => d[i.dataset.s] = i.value); await send("/api/settings", d, "PUT"); }
 
 /* ============================================================ clip editor */
+function classifyClientThumbError(err) {
+  const msg = String(err?.message || err || "");
+  const low = msg.toLowerCase();
+  if (low.includes("failed to fetch") || low.includes("networkerror") || low.includes("network") || low.includes("load failed")) {
+    return {
+      category: "connection",
+      title: "Sem conexão com o servidor do VICE CUT AI",
+      message: "Não foi possível falar com o servidor para gerar a nova thumbnail.",
+      action: "Confira se o servidor (ou túnel Cloudflare) continua rodando e tente novamente."
+    };
+  }
+  if (msg.includes("429") || low.includes("too many") || low.includes("minute") || low.includes("limite")) {
+    return {
+      category: "rate_limit",
+      title: "Muitas tentativas em sequência",
+      message: "Você gerou várias thumbnails muito rápido e atingiu a proteção temporária de limite.",
+      action: "Aguarde alguns segundos e clique em \"Gerar nova imagem\" novamente."
+    };
+  }
+  if (msg.includes("409") || low.includes("still being made") || low.includes("rendering")) {
+    return {
+      category: "busy",
+      title: "Clipe ainda em processamento",
+      message: "Este clipe está sendo renderizado neste momento.",
+      action: "Espere o clipe terminar de renderizar e tente gerar a imagem novamente."
+    };
+  }
+  if (low.includes("500") || low.includes("502") || low.includes("503") || low.includes("unavailable")) {
+    return {
+      category: "server_error",
+      title: "Servidor temporariamente indisponível",
+      message: "O servidor encontrou uma falha momentânea ao montar a nova imagem.",
+      action: "Tente clicar em \"Gerar nova imagem\" novamente em instantes."
+    };
+  }
+  return {
+    category: "api_error",
+    title: "Não foi possível gerar a nova imagem",
+    message: msg || "Ocorreu um erro inesperado ao tentar criar esta thumbnail.",
+    action: "Tente novamente ou altere entre o modo Local e IA."
+  };
+}
+function renderThumbNotice(rep, fallbackShow = false) {
+  if (!rep) return "";
+  if (rep.error) {
+    const e = rep.error;
+    const isWarn = rep.fallback !== false && !fallbackShow;
+    const cls = isWarn ? "warn" : "bad";
+    const needAiBtn = ["no_key", "auth", "billing_cap"].includes(e.category);
+    return `<div class="thumb-alert ${cls}">
+      <b>${esc(e.title || "Aviso na geração da thumbnail")}</b>
+      <span>${esc(e.message || "")}</span>
+      ${e.action ? `<small><b>O que fazer:</b> ${esc(e.action)}</small>` : ""}
+      ${needAiBtn ? `<div class="row" style="margin-top:4px"><button class="btn sm" type="button" data-act="go" data-v="settings" data-tab="ai">Abrir Configurações de IA</button></div>` : ""}
+    </div>`;
+  }
+  const modeTxt = rep.used_mode === "ai" ? `Gerada via IA (${rep.model || "Gemini"})` : "Colagem Local";
+  const varTxt = rep.variant ? ` · Variação #${rep.variant}` : "";
+  const frameTxt = rep.frame_sec != null ? ` · Frame em ${fmt(rep.frame_sec)}` : "";
+  return `<div class="thumb-alert ok"><b>${esc(modeTxt)}${esc(varTxt)}</b><span>Nova imagem aplicada com sucesso${esc(frameTxt)}.</span></div>`;
+}
+function thumbMetaLine(c, rep) {
+  const v = c?.thumb_variant || rep?.variant || 0;
+  const used = rep?.used_mode || c?.thumb_mode || "local";
+  if (!v) return "Clique para testar ou criar uma nova variação de capa.";
+  return `Variação #${v} · ${used === "ai" ? "Modo IA" : "Modo Local"}${rep?.frame_sec != null ? ` · frame ${fmt(rep.frame_sec)}` : ""}`;
+}
 function openClip(jid, cid) { D.jid = jid; D.cid = cid; D.sig = ""; drawClipDlg(true); $("#clipdlg").showModal(); }
 function drawClipDlg(full) {
   const j = jobOf(D.jid), c = j?.clips.find(x => x.id === D.cid), dlg = $("#clipdlg");
@@ -3307,13 +3451,19 @@ function drawClipDlg(full) {
           <p class="sub" style="margin-top:8px">${esc(c.reason || "")}</p></div><button class="btn icon ghost" type="button" data-act="closedlg" aria-label="Close">${ic("x")}</button></div>
         <h3>On the video</h3>
         <label class="f">Big text<input data-f="hook" value="${esc(c.hook)}"></label>
-        ${isLong ? `<label class="f">Thumbnail text<input data-f="thumb_text" maxlength="40" value="${esc(c.thumb_text || "")}" placeholder="2–4 bold words"></label>` : ""}
         <label class="sw"><input type="checkbox" data-f="captions" data-caption-toggle ${c.captions === false ? "" : "checked"}>Generate captions</label>
         <label class="f">Caption language<select id="e_lang" data-f="output_lang" data-caption-style ${c.captions === false ? "disabled" : ""}>${opts(langMap(), c.output_lang || j?.options?.output_lang || defLang())}</select></label>
         <div class="two"><label class="f">Caption style<select data-f="style" data-caption-style ${c.captions === false ? "disabled" : ""}>${opts(S.status.styles, c.style)}</select></label>
           <label class="f">Layout<select data-f="layout">${opts(S.status.layouts, c.layout)}</select></label></div>
         <div class="two"><label class="f">Start (seconds)<input data-f="start" type="number" step="0.5" value="${c.start}"></label>
           <label class="f">End (seconds)<input data-f="end" type="number" step="0.5" value="${c.end}"></label></div>
+        <h3>Thumbnail (1280x720)</h3>
+        ${c.cover ? `<div class="thumb-box" id="dthumbbox"><img class="thumb-prev" id="dthumbimg" src="${m}${esc(c.cover)}?v=${c.version}" alt="Preview da thumbnail"><div class="thumb-spin"><i class="btn-spin"></i>Gerando nova imagem…</div></div>` : ""}
+        <div class="sub" id="dthumbmeta" style="font-size:12px">${esc(thumbMetaLine(c, c.thumb_meta))}</div>
+        <div class="two"><label class="f">Texto da thumbnail<input data-f="thumb_text" maxlength="40" value="${esc(c.thumb_text || c.hook || "")}" placeholder="2–4 palavras"></label>
+          <label class="f">Modo<select data-f="thumb_mode">${opts({local:"Local (rápida)", ai:"IA (Gemini / frame)"}, c.thumb_mode || j?.options?.thumb_mode || "local")}</select></label></div>
+        <div class="row"><button class="btn sm" id="dthumbbtn" type="button" data-act="makethumb" ${rawGone ? "disabled" : ""}>${ic("play")}${c.thumb_variant > 0 ? "Gerar nova imagem" : "Gerar thumbnail"}</button></div>
+        <div id="dthumbnotice">${renderThumbNotice(c.thumb_meta)}</div>
         <h3>Post text</h3>
         <label class="f">Title<input data-f="title" value="${esc(c.title)}"></label>
         <label class="f">Description<textarea data-f="description" rows="2">${esc(c.description)}</textarea></label>
@@ -3327,7 +3477,17 @@ function drawClipDlg(full) {
           : `<p class="help">${isLong ? "No YouTube account connected yet. Connect one in Settings." : "No accounts connected yet. Connect one in Settings."}</p>`}
         <div id="dfoot" class="row" style="margin-top:auto;padding-top:8px;border-top:1px solid var(--line)"></div>
       </div></div>`;
-  } else if (D.sig !== sig) $("#stage").innerHTML = stage;
+  } else if (D.sig !== sig) {
+    $("#stage").innerHTML = stage;
+    const ti = $("#dthumbimg");
+    if (ti && c.cover) ti.src = `${m}${encodeURIComponent(c.cover)}?v=${c.version}`;
+    const tm = $("#dthumbmeta");
+    if (tm) tm.textContent = thumbMetaLine(c, c.thumb_meta);
+    const tn = $("#dthumbnotice");
+    if (tn && c.thumb_meta) tn.innerHTML = renderThumbNotice(c.thumb_meta);
+    const tb = $("#dthumbbtn");
+    if (tb && !tb.disabled) tb.innerHTML = `${ic("play")}${c.thumb_variant > 0 ? "Gerar nova imagem" : "Gerar thumbnail"}`;
+  }
   D.sig = sig;
   const rmBtn = $("#clipdlg [data-act=remake]");
   if (rmBtn) rmBtn.disabled = rawGone;
@@ -3423,7 +3583,7 @@ document.addEventListener("dragover", e => { const a = $(".composer"); if (a) { 
 document.addEventListener("dragleave", () => $(".composer")?.classList.remove("over"));
 document.addEventListener("drop", e => { const a = $(".composer"); if (a) { e.preventDefault(); a.classList.remove("over"); attach(e.dataTransfer.files); } });
 function syncCaptionStyle(toggle) {
-  toggle.closest("#addform, #cform, #clipdlg").querySelectorAll("[data-caption-style]").forEach(i => i.disabled = !toggle.checked);
+  toggle.closest("#addform, #cform, #clipdlg, #recutform").querySelectorAll("[data-caption-style]").forEach(i => i.disabled = !toggle.checked);
 }
 document.addEventListener("change", async e => {
   const t = e.target;
@@ -3468,7 +3628,7 @@ document.addEventListener("click", async e => {
   const a = b.dataset.act, d = b.dataset;
   if (b.tagName === "A") e.preventDefault();
   try {
-    if (a === "go") { closePops(); return go(d.v, d.tab); }
+    if (a === "go") { closePops(); if ($("#clipdlg")?.open) $("#clipdlg").close(); if ($("#formdlg")?.open) $("#formdlg").close(); return go(d.v, d.tab); }
     if (a === "aidismiss") {
       S.aiBanner = null;
       if ($("#ai_alert")) $("#ai_alert").innerHTML = renderAiAlert();
@@ -3699,6 +3859,28 @@ document.addEventListener("click", async e => {
       return;
     }
     if (a === "openclip") return openClip(d.j, d.c);
+    if (a === "recut") {
+      const j = jobOf(d.j);
+      if (!j) return;
+      const dlg = $("#formdlg");
+      const nClips = (j.clips || []).length;
+      dlg.innerHTML = `<form method="dialog" class="dlg wide" id="recutform">
+        <h2>Gerar mais cortes (usando cache)</h2>
+        <p class="help"><b>${esc(j.title || j.source?.name || "Vídeo")}</b> · ${nClips} ${nClips === 1 ? "corte já salvo" : "cortes já salvos"}. A transcrição já está salva em cache: só os novos trechos escolhidos serão processados.</p>
+        ${renderOptionsGrid("rc_", j.options || {}, {isRecut: true, duration: j.duration})}
+        <div class="dlg-foot"><button class="btn" value="no" formnovalidate>Cancelar</button><button class="btn primary" value="yes">${ic("scissors")}Gerar novos cortes</button></div>
+      </form>`;
+      dlg.onclose = async () => {
+        if (dlg.returnValue !== "yes") return;
+        try {
+          const payload = readOptionsGrid("rc_", true);
+          await send(`/api/jobs/${encodeURIComponent(j.id)}/recut`, payload);
+          toast("Gerando novos cortes usando o cache…", "ok");
+          tick();
+        } catch (err) { toast(err.message, "bad"); }
+      };
+      dlg.returnValue = "no"; return dlg.showModal();
+    }
     if (a === "newcreator") {
       const dlg = $("#formdlg");
       dlg.innerHTML = `<form method="dialog" class="dlg"><h2>New creator</h2><p class="help">Each creator gets their own workspace, folder, settings and accounts.</p>
@@ -3984,6 +4166,35 @@ document.addEventListener("click", async e => {
     if (a === "accremove") {
       if (!await ask("Disconnect this account?", "Posts still waiting for it will fail.", "Disconnect", true)) return;
       await api(`/api/accounts/${d.id}`, {method:"DELETE"}); await tick(); return drawSettings();
+    }
+    if (a === "makethumb") {
+      b.disabled = true;
+      const box = $("#dthumbbox"), notice = $("#dthumbnotice"), metaEl = $("#dthumbmeta");
+      if (box) box.classList.add("loading");
+      b.innerHTML = `<i class="btn-spin"></i>Gerando nova imagem…`;
+      let nextLabel = "Gerar nova imagem";
+      try {
+        const thumb_text = $("#clipdlg [data-f='thumb_text']")?.value || "";
+        const thumb_mode = $("#clipdlg [data-f='thumb_mode']")?.value || "local";
+        const updated = await send(`/api/jobs/${encodeURIComponent(D.jid)}/clips/${encodeURIComponent(D.cid)}/thumb`, {thumb_text, thumb_mode, new_variant: true});
+        const uc = updated?.clips?.find(x => x.id === D.cid);
+        const rep = updated?.thumb_report || uc?.thumb_meta || null;
+        const ti = $("#dthumbimg");
+        if (ti && uc?.cover) ti.src = `/media/${encodeURIComponent(D.jid)}/${encodeURIComponent(uc.cover)}?v=${uc.version}&t=${Date.now()}`;
+        if (metaEl) metaEl.textContent = thumbMetaLine(uc, rep);
+        if (notice) notice.innerHTML = renderThumbNotice(rep);
+        if (rep?.fallback && rep?.error?.title) toast(rep.error.title, "bad");
+        else toast(`Nova imagem gerada${rep?.variant ? ` (variação #${rep.variant})` : ""}!`, "ok");
+        await tick();
+      } catch (err) {
+        const cerr = classifyClientThumbError(err);
+        if (notice) notice.innerHTML = renderThumbNotice({error: cerr, fallback: false}, true);
+        toast(cerr.title, "bad");
+      } finally {
+        if (box) box.classList.remove("loading");
+        if (document.body.contains(b)) { b.disabled = false; b.innerHTML = `${ic("play")}${nextLabel}`; }
+      }
+      return;
     }
     if (a === "remake") {
       const body = {}; $$("#clipdlg [data-f]").forEach(i => {

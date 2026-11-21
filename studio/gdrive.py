@@ -969,7 +969,7 @@ def clean_job_source(job: dict, now: float = None, auto_days: int = 0) -> bool:
                 inside = p.resolve().parent == jdir_res
             except OSError:
                 inside = False
-            if inside and p.is_file() and p.name not in ("job.json", "words.json"):
+            if inside and p.is_file() and p.name not in ("job.json", "words.json", "loudness.json"):
                 try:
                     sz = p.stat().st_size
                     p.unlink()
@@ -1098,7 +1098,16 @@ def archive_one(uid: str, jid: str, cid: str, manual: bool = False) -> str:
 
             jdir = Path(job["dir"])
             src_raw = clip.get("src")
-            if src_raw:
+            src_in_use = bool(
+                src_raw
+                and any(
+                    other is not clip
+                    and other.get("status") in ("queued", "rendering")
+                    and str(other.get("src") or "") == str(src_raw)
+                    for other in job.get("clips", [])
+                )
+            )
+            if src_raw and not src_in_use:
                 p = Path(str(src_raw))
                 try:
                     mine = (

@@ -205,6 +205,10 @@ def _overlaps(s, e, others):
     return any(min(e, k["end"]) - max(s, k["start"]) > 0.3 * (e - s) for k in others)
 
 
+def _overlaps_exclude(s, e, excluded):
+    return any(min(e, k["end"]) - max(s, k["start"]) > 0.3 * min(e - s, max(1.0, k["end"] - k["start"])) for k in excluded)
+
+
 def make_lines(words, loud=None, chat=None):
     """Group words into caption-ish lines: [{'s','e','text','loud'}]."""
     lines, cur = [], []
@@ -319,15 +323,33 @@ def _snap(clip, lines, words, min_len, max_len, duration):
     return round(max(0.0, s - 0.15), 2), round(min(duration, e + tail), 2)
 
 
-def fallback_by_loudness(db, words, n, max_len, duration, output_lang: str = "en"):
+def _exclude_note(exclude, a: float, b: float) -> str:
+    if not exclude:
+        return ""
+    hits = sorted(
+        (round(float(x["start"]), 1), round(float(x["end"]), 1))
+        for x in exclude
+        if float(x.get("end", 0)) > a and float(x.get("start", 0)) < b
+    )
+    if not hits:
+        return ""
+    spans = ", ".join(f"{s:.0f}-{e:.0f}s" for s, e in hits[:20])
+    return (
+        f"\n- CRITICAL: Avoid already clipped intervals (seconds): {spans}. "
+        "Pick NEW different moments that do not overlap these ranges.\n"
+    )
+
+
+def fallback_by_loudness(db, words, n, max_len, duration, output_lang: str = "en", exclude=()):
     """No AI available: take the loudest stretches that contain speech."""
     z = loud_zscore(db)
     picks, order = [], np.argsort(-z)
+    blocked = list(exclude or ())
     is_pt = (clean_output_lang(output_lang) if output_lang else "en") == "pt"
     for sec in order:
         s = max(0.0, float(sec) - max_len * 0.6)
         e = min(duration, s + max_len)
-        if any(not (e <= p["start"] or s >= p["end"]) for p in picks):
+        if any(not (e <= p["start"] or s >= p["end"]) for p in picks) or _overlaps_exclude(s, e, blocked):
             continue
         if not any(s <= w["s"] <= e for w in words):
             continue
@@ -356,27 +378,42 @@ def _game_rules(game):
     )
 
 
-def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=15, max_len=60, log=print, game=None, output_lang: str = "en"):
+def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=15, max_len=60, log=print, game=None, output_lang: str = "en", exclude=()):
     z = loud_zscore(db)
     lines = make_lines(words, z)
     if not lines:
         return [], {"model": None, "note": "No speech found."}
     found, used_model, tokens = [], None, 0
+    win_sec = max(WINDOW_SEC, int(max_len) * 3)
+    ov_sec = max(OVERLAP_SEC, min(int(max_len), 180))
     t = 0.0
     windows = []
     while t < duration:
-        windows.append((t, min(duration, t + WINDOW_SEC)))
-        t += WINDOW_SEC - OVERLAP_SEC
+        windows.append((t, min(duration, t + win_sec)))
+        if t + win_sec >= duration:
+            break
+        t += win_sec - ov_sec
     per_window = max(2, min(8, int(np.ceil(max_clips * 1.5 / len(windows))) + 1))
     extra = _game_rules(game)
     lrule = _lang_rule(output_lang)
+    blocked = list(exclude or ())
+    rules_tpl = RULES
+    if max_len >= 120:
+        rules_tpl = rules_tpl.replace(
+            "- Prefer ultra-punchy 15-25s moments for instant visual shock/mechanics/bugs, OR 40-58s high-tension micro-stories with escalating action; avoid awkward mid-tier filler with flat middle sections.",
+            f"- Pick complete, self-contained narrative segments lasting {min_len} to {max_len} seconds with a strong opening hook, continuous development/action, and a clear payoff or conclusion.",
+        )
     for a, b in windows:
         chunk = [l for l in lines if a <= l["s"] < b]
         if len(chunk) < 3:
             continue
+        if len(chunk) > 260:
+            chunk = chunk[::max(1, len(chunk) // 260)]
+        excl = _exclude_note(blocked, a, b)
         prompt = (HEAD.format(title=_safe(title) or "unknown", uploader=_safe(uploader) or "unknown", n=per_window)
                   + extra
-                  + RULES.format(min_len=min_len, max_len=max_len, lang_rule=lrule, transcript=_fmt(chunk)))
+                  + excl
+                  + rules_tpl.format(min_len=min_len, max_len=max_len, lang_rule=lrule, transcript=_fmt(chunk)))
         try:
             out, used_model, spent = ask_ai(prompt, purpose="Video: finding clips")
             tokens += spent
@@ -385,15 +422,15 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
             log(f"AI window {a:.0f}-{b:.0f}s failed: {e}")
     note = ""
     if not used_model:
-        found = fallback_by_loudness(db, words, max_clips, max_len, duration, output_lang=output_lang)
+        found = fallback_by_loudness(db, words, max_clips, max_len, duration, output_lang=output_lang, exclude=blocked)
         note = "The AI was unavailable, so clips were picked by loudness only."
     clips = []
     for c in sorted(found, key=lambda c: -_num(c.get("score"))):
         s, e = _snap(c, lines, words, min_len, max_len, duration)
         if e - s < min(min_len, duration) - 1:
             continue
-        if _overlaps(s, e, clips):
-            continue  # overlaps a better clip
+        if _overlaps_exclude(s, e, blocked) or _overlaps(s, e, clips):
+            continue  # overlaps an existing or better clip
         clips.append(_tidy(c, s, e, game))
         if len(clips) >= max_clips:
             break
@@ -506,12 +543,13 @@ Never put links, @handles, phone numbers, or "visit / buy / subscribe" calls in 
 """
 
 
-def fallback_long_by_loudness(db, words, n, min_len, max_len, duration, game=None, output_lang: str = "pt"):
+def fallback_long_by_loudness(db, words, n, min_len, max_len, duration, game=None, output_lang: str = "pt", exclude=()):
     """No AI available: pick the loudest 10-20 min stretches that contain speech."""
     if duration < min_len or not words:
         return []
     z = loud_zscore(db)
     picks, order = [], np.argsort(-z)
+    blocked = list(exclude or ())
     is_pt = (clean_output_lang(output_lang) if output_lang else "pt") == "pt"
     target_len = min(duration, max(min_len, min(max_len, int((min_len + max_len) / 2))))
     tags = [re.sub(r"\W", "", str(t or ""))[:30] for t in games.tags_of(game) if str(t or "").strip()][:8]
@@ -520,7 +558,7 @@ def fallback_long_by_loudness(db, words, n, min_len, max_len, duration, game=Non
         e = min(duration, s + target_len)
         if e - s < min_len - 1:
             continue
-        if any(not (e <= p["start"] or s >= p["end"]) for p in picks):
+        if any(not (e <= p["start"] or s >= p["end"]) for p in picks) or _overlaps_exclude(s, e, blocked):
             continue
         if not any(s <= w["s"] <= e for w in words):
             continue
@@ -541,13 +579,14 @@ def fallback_long_by_loudness(db, words, n, min_len, max_len, duration, game=Non
 
 
 def find_long_blocks(words, db, duration, title="", uploader="", max_blocks=2, min_len=600, max_len=1200,
-                     log=print, game=None, output_lang: str = "pt"):
+                     log=print, game=None, output_lang: str = "pt", exclude=()):
     """Pick 10-20 min continuous 16:9 narrative blocks using 30-min overlapping transcript windows."""
     z = loud_zscore(db)
     lines = make_lines(words, z)
     if not lines or duration < min_len:
         return [], {"model": None, "tokens": 0, "note": "Not enough speech for a long block."}
     found, used_model, tokens = [], None, 0
+    blocked = list(exclude or ())
     windows, t = [], 0.0
     while t < duration:
         windows.append((t, min(duration, t + LONG_WINDOW_SEC)))
@@ -563,9 +602,11 @@ def find_long_blocks(words, db, duration, title="", uploader="", max_blocks=2, m
             continue
         step = max(1, len(chunk) // 260)
         sampled = chunk[::step]
+        excl = _exclude_note(blocked, a, b)
         prompt = (LONG_BLOCK_HEAD.format(title=_safe(title) or "unknown", uploader=_safe(uploader) or "unknown",
                                          n=max_blocks, min_len=min_len, max_len=max_len)
                   + extra
+                  + excl
                   + LONG_BLOCK_RULES.format(min_len=min_len, max_len=max_len, lang_rule=lrule, transcript=_fmt(sampled)))
         try:
             out, used_model, spent = ask_ai(prompt, LONG_BLOCK_SCHEMA, purpose="Video: finding long blocks")
@@ -575,13 +616,13 @@ def find_long_blocks(words, db, duration, title="", uploader="", max_blocks=2, m
             log(f"Long AI window {a:.0f}-{b:.0f}s failed: {e}")
     note = ""
     if not used_model:
-        blocks = fallback_long_by_loudness(db, words, max_blocks, min_len, max_len, duration, game=game, output_lang=output_lang)
+        blocks = fallback_long_by_loudness(db, words, max_blocks, min_len, max_len, duration, game=game, output_lang=output_lang, exclude=blocked)
         note = "The AI was unavailable, so long blocks were picked by loudness only."
         return blocks, {"model": None, "tokens": tokens, "note": note}
     blocks = []
     for c in sorted(found, key=lambda c: -_num(c.get("score"))):
         s, e = _snap(c, lines, words, min_len, max_len, duration)
-        if e - s < min_len - 5 or _overlaps(s, e, blocks):
+        if e - s < min_len - 5 or _overlaps_exclude(s, e, blocked) or _overlaps(s, e, blocks):
             continue
         item = _tidy(c, s, e, game)
         thumb = roman.to_roman(_text(c.get("thumb_text"), 40)).upper()

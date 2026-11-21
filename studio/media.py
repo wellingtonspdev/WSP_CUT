@@ -2,6 +2,7 @@
 import contextlib
 import json
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -95,12 +96,27 @@ class _Quiet:
     def error(self, m): pass
 
 
+def yt_extra_opts() -> dict:
+    """Apply configured browser cookies / JS runtime options for yt-dlp downloads."""
+    extra = {}
+    browser = (config.env("PEAKCUT_YT_COOKIES_BROWSER") or "").strip().lower()
+    cfile = (config.env("PEAKCUT_YT_COOKIES") or "").strip()
+    if cfile and Path(cfile).is_file():
+        extra["cookiefile"] = cfile
+    elif browser:
+        extra["cookiesfrombrowser"] = (browser,)
+    if shutil.which("node"):
+        extra["js_runtimes"] = {"node": {}}
+        extra["remote_components"] = ["ejs:github"]
+    return extra
+
+
 def _ydl(opts):
     import yt_dlp
     # a channel or playlist link is answered as "a list" straight away, never walked video by video
     return yt_dlp.YoutubeDL({"noplaylist": True, "quiet": True, "no_warnings": True, "logger": _Quiet(),
                              "extract_flat": "in_playlist", "playlistend": 1, "socket_timeout": 20,
-                             "concurrent_fragment_downloads": 4, **opts})
+                             "concurrent_fragment_downloads": 4, **yt_extra_opts(), **opts})
 
 
 def _video_format(height):

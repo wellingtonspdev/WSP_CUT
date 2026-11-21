@@ -13,7 +13,122 @@ from . import ai, config, usage
 from .media import run
 
 THUMB_W, THUMB_H = 1280, 720
-AI_IMAGE_MODELS = ("gemini-3.1-flash-image-preview", "gemini-3-pro-image")
+AI_IMAGE_MODELS = ("gemini-3.1-flash-image-preview", "gemini-2.5-flash-image", "gemini-3-pro-image")
+
+_ERROR_PRIORITY = {
+    "billing_cap": 100,
+    "auth": 95,
+    "no_key": 90,
+    "rate_limit": 80,
+    "timeout": 70,
+    "connection": 65,
+    "server_error": 55,
+    "model_unavailable": 45,
+    "safety_blocked": 35,
+    "api_error": 10,
+}
+
+_VARIANT_PROMPTS = (
+    "Boost subject lighting, sharpness, and dramatic color pop.",
+    "Use punchy viral YouTube contrast, warm rim lighting, and vivid saturation.",
+    "Use cinematic documentary lighting, crisp shadows, and high-clarity focal emphasis.",
+    "Use electric studio rim glow, bold dynamic composition, and crisp highlight pop.",
+)
+
+_VARIANT_THEMES = (
+    {"slash": (845, 780), "line": (255, 230, 0), "colors": ("#FFE600", "#FFFFFF"), "outlines": ((255, 230, 0), (255, 42, 42)), "bars": ((255, 32, 32), (255, 230, 0))},
+    {"slash": (790, 855), "line": (0, 224, 255), "colors": ("#FFFFFF", "#00E5FF"), "outlines": ((0, 224, 255), (255, 255, 255)), "bars": ((0, 200, 255), (255, 255, 255))},
+    {"slash": (820, 745), "line": (255, 136, 0), "colors": ("#FF9F1C", "#FFE600"), "outlines": ((255, 136, 0), (255, 230, 0)), "bars": ((255, 94, 0), (255, 230, 0))},
+    {"slash": (870, 790), "line": (158, 255, 0), "colors": ("#B8FF2C", "#FFFFFF"), "outlines": ((158, 255, 0), (255, 255, 255)), "bars": ((130, 230, 0), (255, 255, 255))},
+)
+
+
+def classify_api_error(status_code: int | None = None, body: str = "", exc: Exception | None = None, provider: str = "Gemini") -> dict:
+    """Turn raw HTTP/network image API failures into categorized human-readable messages."""
+    safe_body = ai.redact(body or "")
+    low = (safe_body + " " + ai.redact(str(exc or ""))).lower()
+
+    if exc is not None:
+        if isinstance(exc, httpx.TimeoutException) or "timed out" in low or "timeout" in low:
+            return {
+                "category": "timeout",
+                "title": f"{provider} demorou para responder",
+                "message": f"A geração de imagem no {provider} excedeu o tempo limite. Geramos uma colagem local no lugar para você não ficar sem capa.",
+                "action": "Aguarde alguns segundos e clique em \"Gerar nova imagem\" novamente, ou use o modo Local.",
+                "status": status_code,
+            }
+        if isinstance(exc, (httpx.ConnectError, httpx.NetworkError, httpx.RemoteProtocolError, ConnectionError, OSError)) or any(
+            tok in low for tok in ("network", "dns", "ssl", "connection", "unreachable", "name or service")
+        ):
+            return {
+                "category": "connection",
+                "title": f"Sem conexão com a API do {provider}",
+                "message": f"Não foi possível conectar ao servidor do {provider} (falha de rede, DNS ou TLS). Aplicamos o modo Local automaticamente.",
+                "action": "Verifique sua internet/VPN/firewall e tente novamente.",
+                "status": status_code,
+            }
+
+    if status_code in (429, 403) and any(tok in low for tok in ("spending cap", "spend cap", "billing", "budget", "payment", "insufficient_quota", "exceeded your current quota")):
+        return {
+            "category": "billing_cap",
+            "title": f"Limite de gastos/cota da conta {provider} atingido",
+            "message": f"Sua conta do {provider} atingiu o teto mensal de gastos ou está sem créditos de imagem no momento. Por isso, aplicamos a colagem Local.",
+            "action": "Revise seu limite em AI Studio (ai.studio/spend) ou troque a chave do Gemini em Configurações → IA.",
+            "status": status_code,
+        }
+
+    if status_code == 429 or any(tok in low for tok in ("rate limit", "too many requests", "resource_exhausted", "quota")):
+        return {
+            "category": "rate_limit",
+            "title": "Muitas requisições em pouco tempo",
+            "message": f"O {provider} limitou temporariamente novas imagens por excesso de pedidos. Geramos uma capa Local agora.",
+            "action": "Espere cerca de 30–60 segundos antes de pedir outra imagem por IA.",
+            "status": status_code,
+        }
+
+    if status_code in (401, 403) or any(tok in low for tok in ("api key not valid", "invalid_api_key", "permission_denied", "unauthorized")):
+        return {
+            "category": "auth",
+            "title": f"Chave do {provider} inválida ou sem permissão",
+            "message": f"A chave configurada não foi aceita pelo serviço de imagem do {provider}. Aplicamos a capa Local.",
+            "action": "Confira sua chave API em Configurações → IA (Principal ou Fallback).",
+            "status": status_code,
+        }
+
+    if status_code == 404 or any(tok in low for tok in ("not found", "not supported", "deprecated")):
+        return {
+            "category": "model_unavailable",
+            "title": "Modelo de imagem indisponível",
+            "message": f"O modelo de thumbnail do {provider} não está disponível para esta chave ou região. Geramos uma versão Local.",
+            "action": "Use o modo Local ou atualize a chave/região da conta Gemini.",
+            "status": status_code,
+        }
+
+    if status_code is not None and 500 <= status_code <= 599:
+        return {
+            "category": "server_error",
+            "title": f"Instabilidade temporária no {provider}",
+            "message": f"Os servidores do {provider} retornaram erro interno (HTTP {status_code}). Geramos a thumbnail Local automaticamente.",
+            "action": "Tente novamente em instantes.",
+            "status": status_code,
+        }
+
+    if status_code == 200 or any(tok in low for tok in ("safety", "prohibited_content", "blocked")):
+        return {
+            "category": "safety_blocked",
+            "title": "Imagem bloqueada pelo filtro da IA",
+            "message": "A IA não devolveu a imagem (possível bloqueio de conteúdo/texto no prompt). Aplicamos a versão Local.",
+            "action": "Tente ajustar o texto da thumbnail ou gere outra variação de frame.",
+            "status": status_code,
+        }
+
+    return {
+        "category": "api_error",
+        "title": f"Não foi possível gerar com a IA do {provider}",
+        "message": "A API retornou uma resposta inesperada. Geramos uma nova colagem Local para você continuar.",
+        "action": "Tente novamente ou mantenha o modo Local.",
+        "status": status_code,
+    }
 
 
 def _short_text(text: str) -> str:
@@ -36,20 +151,49 @@ def _load_font(size: int):
     return ImageFont.load_default()
 
 
-def _try_ai_thumb(frame_bytes: bytes, text: str) -> bytes | None:
-    """Attempt Gemini image generation/editing when Gemini is active; return raw image bytes or None."""
-    try:
-        if not ai.ready() or ai.provider() != "gemini":
-            return None
+def _gemini_thumb_cfg() -> tuple[str, str]:
+    """Resolve Gemini base_url and API key from active, fallback, saved Gemini profile, or .env."""
+    if ai.provider() == "gemini":
         cfg = ai.current()
         addr = (cfg.get("base_url") or ai.PROVIDERS["gemini"][1]).rstrip("/")
-        key = cfg.get("key") or ""
-        if not key:
-            return None
+        return addr, (cfg.get("key") or "")
+    fb = ai.fallback()
+    if fb.get("provider") == "gemini" and fb.get("key"):
+        addr = (fb.get("base_url") or ai.PROVIDERS["gemini"][1]).rstrip("/")
+        return addr, fb["key"]
+    prof = ai._cfg_for("gemini")
+    if prof.get("key"):
+        return (prof.get("address") or ai.PROVIDERS["gemini"][1]).rstrip("/"), prof["key"]
+    env_key = config.env("PEAKCUT_AI_KEY") or ""
+    if env_key.startswith("AIza"):
+        return ai.PROVIDERS["gemini"][1].rstrip("/"), env_key
+    return "", ""
+
+
+def _try_ai_thumb(frame_bytes: bytes, text: str, variant: int = 0) -> tuple[bytes | None, str, dict | None]:
+    """Attempt Gemini image generation/editing when a Gemini key is configured; return (bytes, model, error_dict)."""
+    best_err: dict | None = None
+
+    def _keep(err: dict):
+        nonlocal best_err
+        if best_err is None or _ERROR_PRIORITY.get(err.get("category", ""), 0) > _ERROR_PRIORITY.get(best_err.get("category", ""), 0):
+            best_err = err
+
+    try:
+        addr, key = _gemini_thumb_cfg()
+        if not key or not addr:
+            return None, "", {
+                "category": "no_key",
+                "title": "Nenhuma chave Gemini para imagem configurada",
+                "message": "A geração de thumbnail por IA usa a API de imagem do Gemini, que ainda não está configurada. Geramos uma nova colagem Local no lugar.",
+                "action": "Adicione uma chave Gemini em Configurações → IA (Principal ou Fallback) ou selecione o modo Local.",
+                "status": None,
+            }
         short = _short_text(text)
+        style_hint = _VARIANT_PROMPTS[variant % len(_VARIANT_PROMPTS)]
         prompt = (
             "Create a high-contrast, magnetic 16:9 YouTube gaming/creator thumbnail from this frame. "
-            "Boost subject lighting, sharpness, and dramatic color pop."
+            f"{style_hint}"
             + (f' Overlay bold impactful text: "{short}".' if short else "")
         )
         b64 = base64.b64encode(frame_bytes).decode("ascii")
@@ -72,6 +216,7 @@ def _try_ai_thumb(frame_bytes: bytes, text: str) -> bytes | None:
                     timeout=18.0,
                 )
                 if r.status_code != 200:
+                    _keep(classify_api_error(status_code=r.status_code, body=r.text))
                     continue
                 data = r.json()
                 parts = (((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
@@ -81,12 +226,14 @@ def _try_ai_thumb(frame_bytes: bytes, text: str) -> bytes | None:
                         raw = base64.b64decode(inline["data"])
                         with Image.open(io.BytesIO(raw)) as im:
                             im.verify()
-                        return raw
-            except Exception:  # noqa: BLE001
+                        return raw, model, None
+                _keep(classify_api_error(status_code=200, body=r.text))
+            except Exception as exc:  # noqa: BLE001
+                _keep(classify_api_error(exc=exc))
                 continue
-    except Exception:  # noqa: BLE001
-        return None
-    return None
+    except Exception as exc:  # noqa: BLE001
+        _keep(classify_api_error(exc=exc))
+    return None, "", best_err or classify_api_error()
 
 
 def _add_vignette(canvas: Image.Image) -> Image.Image:
@@ -146,8 +293,9 @@ def _paste_facecam(canvas: Image.Image, raw: Image.Image, facecam: list | None) 
     return cy >= 0.5 and cx >= 0.5
 
 
-def _paste_collage_split(canvas: Image.Image, primary: Image.Image, secondary: Image.Image | None) -> None:
+def _paste_collage_split(canvas: Image.Image, primary: Image.Image, secondary: Image.Image | None, variant: int = 0) -> None:
     """Compose a dynamic 2-panel YouTube collage on the right third with an angled high-contrast divider slash."""
+    theme = _VARIANT_THEMES[variant % len(_VARIANT_THEMES)]
     if secondary is not None:
         sec = secondary.copy()
     else:
@@ -165,14 +313,14 @@ def _paste_collage_split(canvas: Image.Image, primary: Image.Image, secondary: I
     right_layer = Image.new("RGB", (THUMB_W, THUMB_H), (0, 0, 0))
     right_layer.paste(panel, (THUMB_W - panel_w, 0))
 
-    top_x, bot_x = 845, 780
+    top_x, bot_x = theme["slash"]
     mask = Image.new("L", (THUMB_W, THUMB_H), 0)
     ImageDraw.Draw(mask).polygon([(top_x, 0), (THUMB_W, 0), (THUMB_W, THUMB_H), (bot_x, THUMB_H)], fill=255)
     canvas.paste(right_layer, (0, 0), mask)
 
     draw = ImageDraw.Draw(canvas)
     draw.line([(top_x, 0), (bot_x, THUMB_H)], fill=(0, 0, 0), width=16)
-    draw.line([(top_x, 0), (bot_x, THUMB_H)], fill=(255, 230, 0), width=6)
+    draw.line([(top_x, 0), (bot_x, THUMB_H)], fill=theme["line"], width=6)
 
 
 def _pick_best_frames_ai(frames: list[Path]) -> tuple[Path, Path | None]:
@@ -216,10 +364,11 @@ def _pick_best_frames_ai(frames: list[Path]) -> tuple[Path, Path | None]:
     return valid[0], valid[-1]
 
 
-def _draw_headline(canvas: Image.Image, text: str, has_facecam: bool) -> None:
+def _draw_headline(canvas: Image.Image, text: str, has_facecam: bool, variant: int = 0) -> None:
     short = _short_text(text)
     if not short:
         return
+    theme = _VARIANT_THEMES[variant % len(_VARIANT_THEMES)]
     draw = ImageDraw.Draw(canvas)
     max_w = (THUMB_W - 440) if has_facecam else (THUMB_W - 120)
     words = short.split()
@@ -245,7 +394,9 @@ def _draw_headline(canvas: Image.Image, text: str, has_facecam: bool) -> None:
     total_h = sum(line_heights) + max(0, len(lines) - 1) * 14
     x = 54
     y = THUMB_H - total_h - 68
-    colors = ("#FFE600", "#FFFFFF")
+    colors = theme["colors"]
+    outlines = theme["outlines"]
+    bars = theme["bars"]
     for idx, ln in enumerate(lines):
         bb = draw.textbbox((x, y), ln, font=font, stroke_width=8)
         pad_x, pad_y = 16, 8
@@ -253,12 +404,12 @@ def _draw_headline(canvas: Image.Image, text: str, has_facecam: bool) -> None:
             [bb[0] - pad_x, bb[1] - pad_y, bb[2] + pad_x, bb[3] + pad_y],
             radius=12,
             fill=(0, 0, 0),
-            outline=(255, 230, 0) if idx == 0 else (255, 42, 42),
+            outline=outlines[idx % len(outlines)],
             width=3,
         )
         draw.rectangle(
             [bb[0] - pad_x, bb[1] - pad_y, bb[0] - pad_x + 10, bb[3] + pad_y],
-            fill=(255, 32, 32) if idx == 0 else (255, 230, 0),
+            fill=bars[idx % len(bars)],
         )
         draw.text((x + 5, y + 5), ln, font=font, fill="#000000", stroke_width=8, stroke_fill="#000000")
         draw.text(
@@ -279,6 +430,7 @@ def _compose_local(
     facecam: list | None = None,
     secondary_path: Path | None = None,
     collage: bool = True,
+    variant: int = 0,
 ) -> Path:
     with Image.open(frame_path) as raw_in:
         raw = raw_in.convert("RGB")
@@ -294,15 +446,15 @@ def _compose_local(
     canvas = ImageEnhance.Color(canvas).enhance(1.26)
     canvas = ImageEnhance.Sharpness(canvas).enhance(1.18)
     if collage:
-        _paste_collage_split(canvas, raw, sec_raw)
+        _paste_collage_split(canvas, raw, sec_raw, variant=variant)
     canvas = _add_vignette(canvas)
     has_cam = _paste_facecam(canvas, raw, facecam)
-    _draw_headline(canvas, text, has_cam)
+    _draw_headline(canvas, text, has_cam, variant=variant)
     canvas.save(out_jpg, format="JPEG", quality=92)
     return out_jpg
 
 
-def generate(
+def generate_with_report(
     src: Path,
     out_jpg: Path,
     peak_t: float = 1.2,
@@ -310,8 +462,10 @@ def generate(
     facecam: list | None = None,
     mode: str = "local",
     collage: bool = True,
-) -> Path:
-    """Extract frames around peak_t and build a 1280x720 collage JPEG thumbnail (AI with local fallback)."""
+    variant: int = 0,
+    alt_peak_t: float | None = None,
+) -> tuple[Path, dict]:
+    """Extract frames around peak_t, build a 1280x720 thumbnail, and return (out_jpg, report_dict)."""
     out_jpg = Path(out_jpg)
     out_jpg.parent.mkdir(parents=True, exist_ok=True)
     tbase = config.TMP_DIR if len(str(config.TMP_DIR)) < 120 else None
@@ -324,8 +478,14 @@ def generate(
         run(["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", str(src), "-frames:v", "1", "-q:v", "2", str(frame_path)])
         if not frame_path.is_file():
             run(["ffmpeg", "-y", "-v", "error", "-ss", "0.00", "-i", str(src), "-frames:v", "1", "-q:v", "2", str(frame_path)])
-        candidates = [frame_path] if frame_path.is_file() else []
-        alt_times = [max(0.0, t - 2.5) if t >= 2.6 else max(0.0, t * 0.35), t + 2.5]
+        if not frame_path.is_file():
+            raise RuntimeError("Não foi possível extrair um frame deste vídeo.")
+        candidates = [frame_path]
+        shift = 2.5 + (max(0, int(variant)) % 3) * 1.4
+        alt_times = []
+        if alt_peak_t is not None and abs(float(alt_peak_t) - t) >= 0.25:
+            alt_times.append(max(0.0, float(alt_peak_t)))
+        alt_times.extend([max(0.0, t - shift) if t >= shift + 0.1 else max(0.0, t * 0.35), t + shift])
         for idx, at in enumerate(alt_times, 1):
             if abs(at - t) < 0.25:
                 continue
@@ -340,16 +500,63 @@ def generate(
         sec_path = candidates[1] if len(candidates) > 1 else None
         if mode == "ai" and frame_path.is_file():
             if len(candidates) > 1:
-                hero_path, sec_path = _pick_best_frames_ai(candidates)
-            ai_bytes = _try_ai_thumb(hero_path.read_bytes(), text)
+                try:
+                    hero_path, sec_path = _pick_best_frames_ai(candidates)
+                except Exception:  # noqa: BLE001
+                    pass
+            ai_bytes, model_used, ai_err = _try_ai_thumb(hero_path.read_bytes(), text, variant=variant)
             if ai_bytes:
                 try:
                     with Image.open(io.BytesIO(ai_bytes)) as im:
                         fitted = ImageOps.fit(im.convert("RGB"), (THUMB_W, THUMB_H), method=Image.Resampling.LANCZOS)
                         fitted.save(out_jpg, format="JPEG", quality=90)
-                    return out_jpg
-                except Exception:  # noqa: BLE001
-                    pass
-        return _compose_local(hero_path, out_jpg, text=text, facecam=facecam, secondary_path=sec_path, collage=collage)
+                    return out_jpg, {
+                        "requested_mode": "ai",
+                        "used_mode": "ai",
+                        "fallback": False,
+                        "model": model_used,
+                        "variant": variant,
+                        "frame_sec": round(t, 2),
+                        "error": None,
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    ai_err = classify_api_error(exc=exc)
+            _compose_local(hero_path, out_jpg, text=text, facecam=facecam, secondary_path=sec_path, collage=collage, variant=variant)
+            return out_jpg, {
+                "requested_mode": "ai",
+                "used_mode": "local",
+                "fallback": True,
+                "model": "",
+                "variant": variant,
+                "frame_sec": round(t, 2),
+                "error": ai_err,
+            }
+        _compose_local(hero_path, out_jpg, text=text, facecam=facecam, secondary_path=sec_path, collage=collage, variant=variant)
+        return out_jpg, {
+            "requested_mode": "local",
+            "used_mode": "local",
+            "fallback": False,
+            "model": "",
+            "variant": variant,
+            "frame_sec": round(t, 2),
+            "error": None,
+        }
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def generate(
+    src: Path,
+    out_jpg: Path,
+    peak_t: float = 1.2,
+    text: str = "",
+    facecam: list | None = None,
+    mode: str = "local",
+    collage: bool = True,
+    variant: int = 0,
+) -> Path:
+    """Extract frames around peak_t and build a 1280x720 collage JPEG thumbnail (AI with local fallback)."""
+    out_path, _ = generate_with_report(
+        src, out_jpg, peak_t=peak_t, text=text, facecam=facecam, mode=mode, collage=collage, variant=variant
+    )
+    return out_path
